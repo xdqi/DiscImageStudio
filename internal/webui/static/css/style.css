@@ -49,7 +49,8 @@ main {
 #measure-panel { grid-column: 2; }
 
 .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin: 0.4rem 0; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 0.75rem; }
+/* minmax(0, …): let the tracks shrink below the inputs' intrinsic width. */
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.5rem 0.75rem; }
 
 label { display: flex; flex-direction: column; gap: 0.15rem; color: var(--muted); font-size: 0.85rem; }
 input, select {
@@ -59,6 +60,9 @@ input, select {
   border-radius: 6px;
   padding: 0.35rem 0.5rem;
   font: inherit;
+  /* Form controls are floored at their intrinsic width (size=20) inside
+     flex/grid items; lift the floor so they shrink to the column width. */
+  min-width: 0;
 }
 input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 
