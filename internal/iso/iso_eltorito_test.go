@@ -73,8 +73,14 @@ func TestElToritoBridgeDescriptors(t *testing.T) {
 	if bootRecord[0] != 0 || string(bootRecord[1:6]) != "CD001" || bootRecord[6] != 1 {
 		t.Fatal("sector 17 is not a boot record volume descriptor")
 	}
-	if got := string(bootRecord[7:39]); got != "EL TORITO SPECIFICATION         " {
+	// The identifier is NUL-padded (SeaBIOS strcmp()s it).
+	if got := string(bootRecord[7:30]); got != "EL TORITO SPECIFICATION" {
 		t.Fatalf("boot record identifier = %q", got)
+	}
+	for i, v := range bootRecord[30:39] {
+		if v != 0 {
+			t.Fatalf("boot record identifier padding byte %d = %#x, want 0", 30+i, v)
+		}
 	}
 	if got := binary.LittleEndian.Uint32(bootRecord[71:75]); got != bridge.catalogLba {
 		t.Fatalf("boot catalog LBA at offset 71 = %d", got)

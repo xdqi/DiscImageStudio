@@ -447,7 +447,9 @@ func buildBootRecordDescriptor(catalogLba uint32) []byte {
 	// sector[0] = 0: boot record volume descriptor.
 	copy(sector[1:], "CD001")
 	sector[6] = 1
-	isoWritePaddedAscii(sector, 7, 32, elToritoIdentifier)
+	// The identifier field must be NUL-padded, NOT space-padded: SeaBIOS
+	// strcmp()s it against "CD001\001EL TORITO SPECIFICATION".
+	copy(sector[7:39], elToritoIdentifier)
 	binary.LittleEndian.PutUint32(sector[71:], catalogLba)
 	return sector
 }
