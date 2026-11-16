@@ -66,7 +66,7 @@ func TestSimulateHelpIsComplete(t *testing.T) {
 func TestSolveHelpIsComplete(t *testing.T) {
 	command := findCommand(t, "solve")
 	for _, required := range []string{
-		"image", "iso-output", "total-sectors", "total-blocks", "fill-sectors",
+		"image", "iso-output", "usage-map", "total-sectors", "total-blocks", "fill-sectors",
 		"lba", "psn-offset", "data-dir", "file-position", "drawing-start-lba",
 		"volume-label", "inner-radius-mm", "outer-radius-mm", "channel-bit-nm",
 		"start-angle-deg", "pitch-linear", "pitch-quadratic", "pitch-cubic",

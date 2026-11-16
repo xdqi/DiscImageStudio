@@ -80,6 +80,9 @@ func solveCommand(arguments *cliArguments) error {
 	if readCompatibility {
 		return newArgumentError("--read-compatibility true requires --fast-output true and --algorithm dispersion.")
 	}
+	if arguments.Has("usage-map") {
+		return newArgumentError("--usage-map requires multi-sector output; use --fast-output true or a hybrid --data-dir mode.")
+	}
 
 	var outputPath *string
 	if arguments.Has("output") {

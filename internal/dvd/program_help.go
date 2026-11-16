@@ -65,6 +65,9 @@ Solve options:
                             Experimental periodic 0x9B protection for fast dispersion (default false)
   --iterations-per-block N  Full/state-control passes; dispersion ignores search (defaults 100/3/1)
   --iso-output FILE         Write a directly burnable 2048-byte/sector ISO image
+  --usage-map FILE          Also write a PNG map of sector usage: data sectors #FF00FF,
+                            picture sectors in their drawn tone (black/white, or gray
+                            inside the dispersed gray band), unoccupied sectors #00FFFF
   --iso-sectors N           Sector count for a new minimal ISO (image mode reuses total sectors)
   --iso-template FILE       Copy an existing ISO and replace sectors LBA..LBA+15
   --volume-label TEXT       Label for a new minimal ISO (default DVD_IMAGE)

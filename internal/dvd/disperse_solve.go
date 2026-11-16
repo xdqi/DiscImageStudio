@@ -399,6 +399,11 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	}
 	fmt.Println()
 
+	if err := maybeRenderUsageMap(arguments, imageMapping,
+		classifyDispersedSectors(totalSectors, metaEnd, plan.eligible, extents), &plan.band); err != nil {
+		return err
+	}
+
 	resolvedBand := [2]int{int(plan.band[0]), int(plan.band[1])}
 	if err := writeDisperseSidecar(isoOutputPath, plan, udfPlan, bridgeLayer != nil, resolvedBand, plan.marginWhite, plan.marginBlack); err != nil {
 		return err

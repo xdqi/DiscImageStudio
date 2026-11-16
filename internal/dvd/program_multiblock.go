@@ -365,6 +365,10 @@ func solveMultipleBlocks(arguments *cliArguments, fillSectors uint32) error {
 		discInitialBoundary); err != nil {
 		return err
 	}
+	if err := maybeRenderUsageMap(arguments, options.ImageMapping,
+		classifySolveSectors(options.ImageMapping.TotalSectors, lba, fillSectors, hybridIso), nil); err != nil {
+		return err
+	}
 	gray := ", "
 	if result.TotalGrayScore != nil && result.TotalGrayScoreMaximum != nil {
 		grayMetric := "gray-error"
@@ -437,6 +441,10 @@ func writeFastDispersionImage(arguments *cliArguments, isoOutputPath string, opt
 		},
 		context.Background())
 	if err != nil {
+		return err
+	}
+	if err := maybeRenderUsageMap(arguments, options.ImageMapping,
+		classifySolveSectors(options.ImageMapping.TotalSectors, options.StartLba, options.FillSectors, hybridIso), nil); err != nil {
 		return err
 	}
 

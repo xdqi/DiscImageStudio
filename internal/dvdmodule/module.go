@@ -29,6 +29,7 @@ var moduleDescriptor = core.DiscModuleDescriptor{
 			Options: []core.DiscOptionDefinition{
 				core.Opt("image", "Source image mapped onto the disc (PNG, JPEG, BMP or GIF)", core.OptionInputFile, true, "", ""),
 				core.Opt("iso-output", "Directly burnable 2048-byte/sector ISO image", core.OptionOutputFile, true, "", ""),
+				core.Opt("usage-map", "Also write a PNG map of sector usage: data sectors #FF00FF, picture sectors in their drawn tone (black/white, or gray inside the dispersed gray band), unoccupied sectors #00FFFF", core.OptionOutputFile, false, "", ""),
 				core.Opt("total-sectors", "Reported count of 2048-byte sectors", core.OptionInteger, true, "", ""),
 				core.Opt("total-blocks", "Alias for --total-sectors", core.OptionInteger, false, "", ""),
 				core.Opt("fill-sectors", "Sectors to fill with the image (multiple of 16; automatic with --data-dir)", core.OptionInteger, false, "16", ""),
