@@ -57,10 +57,7 @@ func assembleDispersedImage(t *testing.T, plan *UdfDispersedPlan, content func(i
 
 // TestUdfDispersedParity verifies that a dispersed plan whose extents are
 // placed exactly where planUdf puts the file data produces byte-identical
-// descriptor/metadata sectors, except for the uid/gid/permissions fields of
-// file entries (and the tag checksum/CRC they feed): the dispersed writer
-// defaults ownership to root and copies modes from the source, while the
-// contiguous writer keeps the C# fixed defaults for .NET byte parity.
+// descriptor/metadata sectors.
 func TestUdfDispersedParity(t *testing.T) {
 	root := buildIsoTestTree(t)
 	const volumeSectors = 2048
@@ -125,7 +122,7 @@ func TestUdfDispersedParity(t *testing.T) {
 		}
 		sectors++
 		want := golden[int(lba)*LogicalSectorBytes : int(lba+1)*LogicalSectorBytes]
-		if !bytes.Equal(maskIntentionalFileEntryDiffs(data), maskIntentionalFileEntryDiffs(want)) {
+		if !bytes.Equal(data, want) {
 			for i := range want {
 				if data[i] != want[i] {
 					t.Fatalf("descriptor sector %d: first diff at offset %d: got %02x want %02x", lba, i, data[i], want[i])
@@ -178,24 +175,6 @@ func TestUdfDispersedParity(t *testing.T) {
 			t.Fatalf("golden sector %d is nonzero but DescriptorAt = false and it is not file data", lba)
 		}
 	}
-}
-
-// maskIntentionalFileEntryDiffs zeroes the bytes where the dispersed writer
-// deliberately differs from the contiguous one (uid/gid/permissions — copied
-// ownership and modes — plus the tag checksum/CRC they feed), so everything
-// else is still compared byte-for-byte.
-func maskIntentionalFileEntryDiffs(sector []byte) []byte {
-	if binary.LittleEndian.Uint16(sector[0:2]) != 261 { // file entry tag
-		return sector
-	}
-	masked := append([]byte(nil), sector...)
-	masked[4] = 0 // tag checksum
-	masked[8] = 0 // descriptor CRC
-	masked[9] = 0
-	for i := 36; i < 48; i++ { // uid, gid, permissions
-		masked[i] = 0
-	}
-	return masked
 }
 
 // udfDisperseTestAd is one parsed short allocation descriptor.

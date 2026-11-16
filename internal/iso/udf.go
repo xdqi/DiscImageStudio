@@ -76,13 +76,18 @@ func planUdf(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 		}
 	}
 
-	root := &udfNode{sourcePath: sourcePath, isDirectory: true, timestamp: recorded}
+	// Ownership defaults to uid:gid 0:0 (root) and each node's mode is copied
+	// from the source. This deliberately differs from the original .NET CLI
+	// (uint.MaxValue uid/gid, fixed permissions); golden/CLI comparisons mask
+	// those bytes.
+	root := &udfNode{sourcePath: sourcePath, isDirectory: true, timestamp: recorded, mode: 0o555}
 	if sourceDirectory != "" {
 		info, err := os.Lstat(sourcePath)
 		if err != nil {
 			return nil, err
 		}
 		root.timestamp = info.ModTime().UTC()
+		root.mode = uint32(info.Mode().Perm())
 	}
 	nodes := []*udfNode{root}
 	// Iterative traversal avoids a call-stack dependency on the depth of the source tree.
@@ -112,6 +117,7 @@ func planUdf(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 				timestamp:   entry.info.ModTime().UTC(),
 				uniqueId:    uint64(len(nodes)) + 15,
 				isSymlink:   isSymlink,
+				mode:        uint32(entry.info.Mode().Perm()),
 			}
 			if isSymlink {
 				target, err := os.Readlink(fullName)
@@ -552,6 +558,42 @@ func udfFileSetDescriptor(plan *UdfLayoutPlan) ([]byte, error) {
 	return data, nil
 }
 
+// udfPermissionsFromMode maps Unix rwxrwxrwx permission bits to the
+// ECMA-167 file entry permission word (bits 0-4 others, 5-9 group, 10-14
+// user; within each group: execute, write, read, [change attribute],
+// [delete]). The historical fixed defaults 0o444/0o555 map to 0x1084/0x14a5.
+func udfPermissionsFromMode(mode uint32) uint32 {
+	var permissions uint32
+	if mode&0o400 != 0 {
+		permissions |= 1 << 12
+	}
+	if mode&0o200 != 0 {
+		permissions |= 1 << 11
+	}
+	if mode&0o100 != 0 {
+		permissions |= 1 << 10
+	}
+	if mode&0o040 != 0 {
+		permissions |= 1 << 7
+	}
+	if mode&0o020 != 0 {
+		permissions |= 1 << 6
+	}
+	if mode&0o010 != 0 {
+		permissions |= 1 << 5
+	}
+	if mode&0o004 != 0 {
+		permissions |= 1 << 2
+	}
+	if mode&0o002 != 0 {
+		permissions |= 1 << 1
+	}
+	if mode&0o001 != 0 {
+		permissions |= 1
+	}
+	return permissions
+}
+
 func udfFileEntry(plan *UdfLayoutPlan, node *udfNode) []byte {
 	data := make([]byte, LogicalSectorBytes)
 	udfU16(data, 20, 4) // ICB strategy type 4, short allocation descriptors.
@@ -569,12 +611,15 @@ func udfFileEntry(plan *UdfLayoutPlan, node *udfNode) []byte {
 	}
 	udfU32(data, 28, parent.entryLba-plan.partitionStartLba)
 	udfU16(data, 34, 0) // AD type 0 (short_ad); no optional ICB flags.
-	udfU32(data, 36, math.MaxUint32)
-	udfU32(data, 40, math.MaxUint32)
-	if node.isDirectory {
-		udfU32(data, 44, 0x14a5) // Read (and directory traverse).
-	} else {
+	// Ownership defaults to uid:gid 0:0 (root); the mode is copied from the
+	// source. Symlinks keep the fixed read-only word (their source mode is
+	// the link's own, not the target's).
+	udfU32(data, 36, 0)
+	udfU32(data, 40, 0)
+	if node.isSymlink {
 		udfU32(data, 44, 0x1084)
+	} else {
+		udfU32(data, 44, udfPermissionsFromMode(node.mode))
 	}
 	linkCount := 1
 	if node.isDirectory {

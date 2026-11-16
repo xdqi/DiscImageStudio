@@ -303,8 +303,29 @@ func TestGoldenBdDataImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	image := buf.Bytes()
+	maskUdfFileEntryBytes(image)
+	maskUdfFileEntryBytes(golden)
 	compareBytes(t, "UDF front metadata", image[:320*LogicalSectorBytes], golden[:320*LogicalSectorBytes])
 	compareBytes(t, "UDF tail metadata", image[1760*LogicalSectorBytes:], golden[1760*LogicalSectorBytes:])
+}
+
+// maskUdfFileEntryBytes zeroes the uid/gid/permissions fields of every UDF
+// file entry (tag 261) in the image, plus the tag checksum/CRC they feed:
+// the writers deliberately differ from the original .NET CLI there (root
+// ownership, uid:gid 0:0, and modes copied from the source).
+func maskUdfFileEntryBytes(data []byte) {
+	for lba := 0; (lba+1)*LogicalSectorBytes <= len(data); lba++ {
+		sector := data[lba*LogicalSectorBytes:]
+		if binary.LittleEndian.Uint16(sector[0:2]) != 261 {
+			continue
+		}
+		sector[4] = 0 // tag checksum
+		sector[8] = 0 // descriptor CRC
+		sector[9] = 0
+		for i := 36; i < 48; i++ { // uid, gid, permissions
+			sector[i] = 0
+		}
+	}
 }
 
 func compareBytes(t *testing.T, what string, got, want []byte) {

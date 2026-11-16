@@ -85,8 +85,7 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 	}
 
 	// Ownership defaults to uid:gid 0:0 (root) and each node's mode is copied
-	// from the source (the dispersed writer's convention; the contiguous
-	// writer keeps the C# fixed defaults for byte parity).
+	// from the source (same convention as the contiguous writer).
 	root := &udfNode{sourcePath: sourcePath, isDirectory: true, timestamp: recorded, mode: 0o555}
 	if sourceDirectory != "" {
 		info, err := os.Lstat(sourcePath)
@@ -662,42 +661,6 @@ func udfDispersedRenderDirectoryData(plan *UdfLayoutPlan, rendered map[uint32][]
 			rendered[directory.dataLba+uint32(sector)] = data[sector*LogicalSectorBytes : (sector+1)*LogicalSectorBytes]
 		}
 	}
-}
-
-// udfPermissionsFromMode maps Unix rwxrwxrwx permission bits to the
-// ECMA-167 file entry permission word (bit 0-4 others, 5-9 group, 10-14
-// user; within each group: execute, write, read, [change attribute],
-// [delete]). The defaults 0o444/0o555 map to the historical 0x1084/0x14a5.
-func udfPermissionsFromMode(mode uint32) uint32 {
-	var permissions uint32
-	if mode&0o400 != 0 {
-		permissions |= 1 << 12
-	}
-	if mode&0o200 != 0 {
-		permissions |= 1 << 11
-	}
-	if mode&0o100 != 0 {
-		permissions |= 1 << 10
-	}
-	if mode&0o040 != 0 {
-		permissions |= 1 << 7
-	}
-	if mode&0o020 != 0 {
-		permissions |= 1 << 6
-	}
-	if mode&0o010 != 0 {
-		permissions |= 1 << 5
-	}
-	if mode&0o004 != 0 {
-		permissions |= 1 << 2
-	}
-	if mode&0o002 != 0 {
-		permissions |= 1 << 1
-	}
-	if mode&0o001 != 0 {
-		permissions |= 1
-	}
-	return permissions
 }
 
 // udfDispersedFileEntry is udfFileEntry with an explicit, possibly fragmented

@@ -66,6 +66,12 @@ func TestCmpAgainstCSharp(t *testing.T) {
 		if len(got) != len(want) {
 			t.Fatalf("%s: size %d != %d", name, len(got), len(want))
 		}
+		if udf {
+			// UDF file entries deliberately differ from the C# image in the
+			// uid/gid/permissions fields (root ownership, source modes).
+			maskUdfFileEntryBytes(got)
+			maskUdfFileEntryBytes(want)
+		}
 		for i := range want {
 			if got[i] != want[i] {
 				t.Fatalf("%s: first diff at byte %d (sector %d offset %d): got %02x want %02x",

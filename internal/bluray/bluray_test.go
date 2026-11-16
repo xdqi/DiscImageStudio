@@ -3,6 +3,7 @@ package bluray_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"image"
 	"image/color"
 	"image/png"
@@ -333,7 +334,9 @@ func TestGoldenBdDataIso(t *testing.T) {
 	// primary/reserve volume descriptors (volume set id + recording time), the
 	// logical volume integrity descriptor and the file-set descriptor. Mask
 	// those fields along with each descriptor's tag checksum (byte 4) and tag
-	// CRC (bytes 8..9).
+	// CRC (bytes 8..9). File entries (tag 261) additionally differ from the
+	// .NET golden in the uid/gid/permissions fields (offsets 36..47): the Go
+	// writers default to root ownership and copy modes from the source.
 	maskSectors := []struct {
 		lba    int64
 		ranges [][2]int
@@ -350,6 +353,19 @@ func TestGoldenBdDataIso(t *testing.T) {
 				for i := base + int64(r[0]); i < base+int64(r[1]); i++ {
 					data[i] = 0
 				}
+			}
+		}
+		// File entries anywhere in the image (tag 261).
+		for lba := int64(0); (lba+1)*2048 <= int64(len(data)); lba++ {
+			base := lba * 2048
+			if binary.LittleEndian.Uint16(data[base:]) != 261 {
+				continue
+			}
+			data[base+4] = 0
+			data[base+8] = 0
+			data[base+9] = 0
+			for i := int64(36); i < 48; i++ {
+				data[base+i] = 0
 			}
 		}
 	}

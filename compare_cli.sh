@@ -23,6 +23,37 @@ check() { # name file
 	echo "identical: $1"
 }
 
+# cmp_udf_masked compares two images like check(), but ignores the
+# uid/gid/permissions fields of UDF file entries (tag 261) and the tag
+# checksum/CRC they feed: the Go writers default ownership to root and copy
+# modes from the source, while the original .NET CLI writes fixed defaults.
+cmp_udf_masked() {
+	python3 - "$1" "$2" <<'EOF'
+import sys
+
+def masked(path):
+    data = bytearray(open(path, "rb").read())
+    for lba in range(len(data) // 2048):
+        base = lba * 2048
+        if int.from_bytes(data[base:base+2], "little") != 261:
+            continue
+        data[base+4] = 0
+        data[base+8] = data[base+9] = 0
+        for i in range(base+36, base+48):
+            data[i] = 0
+    return data
+
+a, b = masked(sys.argv[1]), masked(sys.argv[2])
+if len(a) != len(b):
+    sys.exit(1)
+for i in range(len(a)):
+    if a[i] != b[i]:
+        print(f"first diff at byte {i} (sector {i//2048} offset {i%2048})", file=sys.stderr)
+        sys.exit(1)
+sys.exit(0)
+EOF
+}
+
 # --- CD audio (byte-exact) ---
 "$GO" cd-generate --input input.png --output go-track.wav --sectors 32 > /dev/null
 "$FX" cd-generate --input input.png --output fx-track.wav --sectors 32 > /dev/null
@@ -60,6 +91,8 @@ cmp -s go-bd-probe.bin fx-bd-probe.bin && echo "identical: bd-probe" || { echo "
 
 "$GO" bd-generate --input input.png --output go-bd.iso --total-sectors 1024 > /dev/null
 "$FX" bd-generate --input input.png --output fx-bd.iso --total-sectors 1024 > /dev/null
-cmp -s go-bd.iso fx-bd.iso && echo "identical: bd-generate" || { echo "MISMATCH: bd-generate"; exit 1; }
+# The UDF file entries differ in uid/gid/permissions by design (root
+# ownership, source modes); everything else must be byte-identical.
+cmp_udf_masked go-bd.iso fx-bd.iso && echo "identical: bd-generate (uid/gid/mode ignored)" || { echo "MISMATCH: bd-generate"; exit 1; }
 
 echo "ALL CLI COMPARISONS IDENTICAL"
