@@ -77,7 +77,10 @@ identifiers).
 
 ```sh
 go test ./...
-sh test_cli.sh ./disc-image-studio   # end-to-end smoke test
+sh test_cli.sh ./disc-image-studio   # end-to-end smoke test; expects the
+                                     # original DiscImageStudio/ checkout as a
+                                     # sibling directory (it reuses the .NET
+                                     # repo's 256px test fixture)
 (cd webtests && for f in test_*.mjs; do node --test "$f"; done)   # browser-math tests
 ```
 
