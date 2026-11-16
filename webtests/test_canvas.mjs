@@ -179,6 +179,70 @@ function makeElement(id) {
   return el;
 }
 
+test("rectification overlays the computed disc outline on the photo", async () => {
+  installGlobals();
+  const elements = new Map();
+  globalThis.document = {
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, makeElement(id));
+      return elements.get(id);
+    },
+    createElement: (tag) => (tag === "canvas" ? makeCanvas(800) : makeElement(tag)),
+    querySelectorAll: () => [],
+  };
+  Object.defineProperty(globalThis, "navigator", {
+    value: { clipboard: { writeText: async () => {} } },
+    configurable: true,
+  });
+  // A 400×300 photo; the disc spans 2 px/mm: outer 120 px, hole 15 px.
+  globalThis.createImageBitmap = async () => ({ width: 400, height: 300, close() {} });
+  for (const [id, value] of Object.entries({
+    kind: "dvd", stage: "coarse", "p-r0": "24", "p-r1": "58", "p-sectors": "2297888",
+    "p-density": "133.3", "p-c1": "0", "p-c2": "0", "p-c3": "0", "p-usable": "",
+    "disc-size": "60",
+  })) {
+    document.getElementById(id).value = value;
+  }
+  // Fresh module instance: the app state must not leak between tests.
+  await import(JS + "app.js?rectify-overlay");
+
+  const photoEl = document.getElementById("photo-canvas");
+  document.getElementById("photo-input").fire("change", { target: { files: [{}] } });
+  await new Promise((resolve) => setTimeout(resolve, 0)); // let Photo.load resolve
+  flushFrames();
+
+  // The fit maps image px -> screen px with scale 2 (fit to 800×600).
+  const click = (ix, iy) =>
+    photoEl.fire("pointerdown", { button: 0, clientX: ix * 2, clientY: iy * 2, preventDefault() {} });
+  for (let k = 0; k < 8; k++) { // outer edge: 120 px around (200,150)
+    const a = (k / 8) * 2 * Math.PI;
+    click(200 + 120 * Math.cos(a), 150 + 120 * Math.sin(a));
+  }
+  document.getElementById("mode-hole").fire("click");
+  for (let k = 0; k < 8; k++) { // hole edge: 15 px around (200,150), rotated
+    const a = (k / 8) * 2 * Math.PI + 0.2;
+    click(200 + 15 * Math.cos(a), 150 + 15 * Math.sin(a));
+  }
+  flushFrames();
+  assert.equal(photoEl.ctx.calls.arc, 16, "16 edge markers drawn");
+
+  document.getElementById("rectify").fire("click");
+  flushFrames();
+  const status = document.getElementById("rectify-status");
+  assert.ok(status.className.includes("ok"), `rectify status: ${status.className} ${status.textContent}`);
+  assert.equal(photoEl.ctx.calls.moveTo, 2, "two outline polylines (outer edge + hole)");
+  assert.ok(photoEl.ctx.calls.lineTo > 100, `outline segments drawn: ${photoEl.ctx.calls.lineTo}`);
+
+  // Clearing the points also drops the computed outline they produced.
+  photoEl.ctx.calls.lineTo = 0;
+  photoEl.ctx.calls.moveTo = 0;
+  photoEl.ctx.calls.arc = 0;
+  document.getElementById("clear-points").fire("click");
+  flushFrames();
+  assert.equal(photoEl.ctx.calls.moveTo, 0, "no outline after Clear");
+  assert.equal(photoEl.ctx.calls.arc, 0, "no markers after Clear");
+});
+
 test("Clear empties the rectification points; re-import keeps single handlers", async () => {
   installGlobals();
   const elements = new Map();

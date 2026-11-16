@@ -34,6 +34,9 @@ const state = {
 
 const COARSE_EDGE_NAMES = ["band 1 inner", "band 1 outer", "band 2 inner", "band 2 outer", "band 3 inner", "band 3 outer"];
 
+// Physical centre-hole radius (mm) used by the rectifier.
+const PHYSICAL_HOLE_RADIUS_MM = 7.5;
+
 // ---------- parameters & burn command ----------
 
 function readParams() {
@@ -155,10 +158,38 @@ async function importPhoto(file) {
   $("measure-panel").classList.add("hidden");
   if (!photoCanvas) photoCanvas = new ImageCanvas($("photo-canvas"), state.photo.canvas);
   else photoCanvas.setImage(state.photo.canvas, false);
+  photoCanvas.overlays = []; // any previous rectification belongs to the old photo
   wirePhotoCanvas();
   photoCanvas.fit();
   setStatus($("rectify-status"),
     `Photo loaded (${state.photo.width}×${state.photo.height}). Mark the physical outer edge and the centre-hole edge, then compute the rectification.`, "");
+}
+
+// Draws the computed disc outline (physical outer edge and centre hole) back
+// onto the photo through the rectification transform, so the fit can be
+// verified against the picture. Clears the overlay when no transform is set.
+function updateRectificationOverlay() {
+  if (!photoCanvas) return;
+  photoCanvas.overlays = [];
+  if (state.transform) {
+    try {
+      for (const [radiusMm, color] of [
+        [state.physicalOuterRadiusMm, "#4da3ff"],
+        [PHYSICAL_HOLE_RADIUS_MM, "#ffa54d"],
+      ]) {
+        const points = [];
+        for (let i = 0; i <= 360; i++) {
+          const angle = (i / 360) * 2 * Math.PI;
+          const p = state.transform.discToSourcePoint({ x: radiusMm * Math.cos(angle), y: radiusMm * Math.sin(angle) });
+          points.push([p.x, p.y]);
+        }
+        photoCanvas.overlays.push({ points, color, width: 2, dash: [6, 4], world: false });
+      }
+    } catch {
+      photoCanvas.overlays = []; // near the projective horizon: no overlay
+    }
+  }
+  photoCanvas.redraw();
 }
 
 function computeRectification() {
@@ -167,11 +198,19 @@ function computeRectification() {
     return;
   }
   const physicalOuter = parseFloat($("disc-size").value);
-  const result = fitPhotoTransform(state.outerPoints, state.holePoints, physicalOuter, 7.5);
+  const result = fitPhotoTransform(state.outerPoints, state.holePoints, physicalOuter, PHYSICAL_HOLE_RADIUS_MM);
   setStatus($("rectify-status"), result.message, result.succeeded ? "ok" : "error");
-  if (!result.succeeded) return;
+  if (!result.succeeded) {
+    // No new rectification: drop the stale overlay (the points may have moved).
+    if (photoCanvas) {
+      photoCanvas.overlays = [];
+      photoCanvas.redraw();
+    }
+    return;
+  }
   state.transform = result.transform;
   state.physicalOuterRadiusMm = physicalOuter;
+  updateRectificationOverlay();
   renderRectifiedView(2400);
 }
 
@@ -592,6 +631,7 @@ async function loadSession(file) {
       try {
         const { CalibrationPhotoTransform } = await import("./rectify.js");
         state.transform = new CalibrationPhotoTransform(session.transform9);
+        updateRectificationOverlay();
         renderRectifiedView(2400);
       } catch { /* keep unrectified */ }
     }
@@ -640,7 +680,10 @@ function main() {
     // reassigning them here would leave the old points on screen.
     state.outerPoints.length = 0;
     state.holePoints.length = 0;
-    if (photoCanvas) photoCanvas.redraw();
+    if (photoCanvas) {
+      photoCanvas.overlays = []; // the computed outline belonged to those points
+      photoCanvas.redraw();
+    }
     setStatus($("rectify-status"), "Edge points cleared.", "");
   });
   $("rectify").addEventListener("click", computeRectification);
