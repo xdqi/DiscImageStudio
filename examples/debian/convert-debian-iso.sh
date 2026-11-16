@@ -60,6 +60,7 @@ done
 [ -n "$INPUT_ISO" ] && [ -n "$OUTPUT_ISO" ] || die "usage: convert-debian-iso.sh [OPTIONS] INPUT.iso OUTPUT.iso"
 [ -f "$INPUT_ISO" ] || die "input ISO not found: $INPUT_ISO"
 [ -f "$IMAGE" ] || die "cover image not found: $IMAGE (use --image)"
+PITCH_ARGS+=(--inner-radius-mm "$INNER_MM" --outer-radius-mm "$OUTER_MM")
 
 DIS="${DISC_IMAGE_STUDIO:-}"
 if [ -z "$DIS" ]; then
@@ -206,7 +207,6 @@ if [ -n "$SIMULATE" ]; then
 	echo "rendering the simulated preview to $SIMULATE ..."
 	"$DIS" simulate "${EXTRA_ARGS[@]}" "${PITCH_ARGS[@]}" --iso "$OUTPUT_ISO" --output "$SIMULATE" \
 		--total-sectors "$TOTAL_SECTORS" \
-		--inner-radius-mm "$INNER_MM" --outer-radius-mm "$OUTER_MM" \
 		--samples-per-sector 1024
 fi
 
