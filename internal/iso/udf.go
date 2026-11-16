@@ -47,6 +47,9 @@ type udfNode struct {
 	isSymlink   bool
 	linkTarget  string
 	linkContent []byte
+	// mode carries the source permission bits (Unix rwxrwxrwx). Used by the
+	// dispersed writer; the contiguous writer keeps the C# fixed defaults.
+	mode uint32
 }
 
 // planUdf ports UdfImageWriter.Plan. An empty sourceDirectory is the C#

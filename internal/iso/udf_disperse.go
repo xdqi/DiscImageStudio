@@ -84,13 +84,17 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 		}
 	}
 
-	root := &udfNode{sourcePath: sourcePath, isDirectory: true, timestamp: recorded}
+	// Ownership defaults to uid:gid 0:0 (root) and each node's mode is copied
+	// from the source (the dispersed writer's convention; the contiguous
+	// writer keeps the C# fixed defaults for byte parity).
+	root := &udfNode{sourcePath: sourcePath, isDirectory: true, timestamp: recorded, mode: 0o555}
 	if sourceDirectory != "" {
 		info, err := os.Lstat(sourcePath)
 		if err != nil {
 			return nil, err
 		}
 		root.timestamp = info.ModTime().UTC()
+		root.mode = uint32(info.Mode().Perm())
 	}
 	nodes := []*udfNode{root}
 	// Iterative traversal, identical to planUdf.
@@ -120,6 +124,7 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 				timestamp:   entry.info.ModTime().UTC(),
 				uniqueId:    uint64(len(nodes)) + 15,
 				isSymlink:   isSymlink,
+				mode:        uint32(entry.info.Mode().Perm()),
 			}
 			if isSymlink {
 				target, err := os.Readlink(fullName)
@@ -157,6 +162,7 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 			timestamp:  recorded,
 			uniqueId:   uint64(len(nodes)) + 15,
 			dataLength: extra.Size,
+			mode:       0o444, // synthetic files: read-only, as before
 		}
 		root.children = append(root.children, child)
 		nodes = append(nodes, child)
@@ -579,7 +585,13 @@ func (p *UdfDispersedPlan) renderDescriptors(perFile [][]UdfFileExtent) (map[uin
 	fileIndex := 0
 	for _, node := range plan.nodes {
 		if node.isDirectory {
-			rendered[node.entryLba] = udfFileEntry(plan, node)
+			// Directory data placement is fixed (contiguous after the file
+			// entries); render through the dispersed writer so the ownership
+			// and mode conventions apply to directories as well.
+			rendered[node.entryLba] = udfDispersedFileEntry(plan, node, []UdfFileExtent{{
+				FileIndex: -1, Offset: 0, Lba: node.dataLba,
+				Sectors: uint32(sectorCount(node.dataLength)),
+			}})
 			continue
 		}
 		rendered[node.entryLba] = udfDispersedFileEntry(plan, node, perFile[fileIndex])
@@ -652,6 +664,42 @@ func udfDispersedRenderDirectoryData(plan *UdfLayoutPlan, rendered map[uint32][]
 	}
 }
 
+// udfPermissionsFromMode maps Unix rwxrwxrwx permission bits to the
+// ECMA-167 file entry permission word (bit 0-4 others, 5-9 group, 10-14
+// user; within each group: execute, write, read, [change attribute],
+// [delete]). The defaults 0o444/0o555 map to the historical 0x1084/0x14a5.
+func udfPermissionsFromMode(mode uint32) uint32 {
+	var permissions uint32
+	if mode&0o400 != 0 {
+		permissions |= 1 << 12
+	}
+	if mode&0o200 != 0 {
+		permissions |= 1 << 11
+	}
+	if mode&0o100 != 0 {
+		permissions |= 1 << 10
+	}
+	if mode&0o040 != 0 {
+		permissions |= 1 << 7
+	}
+	if mode&0o020 != 0 {
+		permissions |= 1 << 6
+	}
+	if mode&0o010 != 0 {
+		permissions |= 1 << 5
+	}
+	if mode&0o004 != 0 {
+		permissions |= 1 << 2
+	}
+	if mode&0o002 != 0 {
+		permissions |= 1 << 1
+	}
+	if mode&0o001 != 0 {
+		permissions |= 1
+	}
+	return permissions
+}
+
 // udfDispersedFileEntry is udfFileEntry with an explicit, possibly fragmented
 // extent list instead of the single contiguous run starting at node.dataLba.
 // Each caller extent emits one short_ad (8 bytes: length with high-2-bits
@@ -677,12 +725,15 @@ func udfDispersedFileEntry(plan *UdfLayoutPlan, node *udfNode, extents []UdfFile
 	}
 	udfU32(data, 28, parent.entryLba-plan.partitionStartLba)
 	udfU16(data, 34, 0) // AD type 0 (short_ad); no optional ICB flags.
-	udfU32(data, 36, math.MaxUint32)
-	udfU32(data, 40, math.MaxUint32)
-	if node.isDirectory {
-		udfU32(data, 44, 0x14a5) // Read (and directory traverse).
-	} else {
+	// Ownership defaults to uid:gid 0:0 (root); the mode is copied from the
+	// source file. Symlinks keep the fixed read-only word (their source mode
+	// is the link's own, not the target's).
+	udfU32(data, 36, 0)
+	udfU32(data, 40, 0)
+	if node.isSymlink {
 		udfU32(data, 44, 0x1084)
+	} else {
+		udfU32(data, 44, udfPermissionsFromMode(node.mode))
 	}
 	linkCount := 1
 	if node.isDirectory {

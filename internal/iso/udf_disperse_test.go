@@ -57,7 +57,10 @@ func assembleDispersedImage(t *testing.T, plan *UdfDispersedPlan, content func(i
 
 // TestUdfDispersedParity verifies that a dispersed plan whose extents are
 // placed exactly where planUdf puts the file data produces byte-identical
-// descriptor/metadata sectors.
+// descriptor/metadata sectors, except for the uid/gid/permissions fields of
+// file entries (and the tag checksum/CRC they feed): the dispersed writer
+// defaults ownership to root and copies modes from the source, while the
+// contiguous writer keeps the C# fixed defaults for .NET byte parity.
 func TestUdfDispersedParity(t *testing.T) {
 	root := buildIsoTestTree(t)
 	const volumeSectors = 2048
@@ -122,7 +125,7 @@ func TestUdfDispersedParity(t *testing.T) {
 		}
 		sectors++
 		want := golden[int(lba)*LogicalSectorBytes : int(lba+1)*LogicalSectorBytes]
-		if !bytes.Equal(data, want) {
+		if !bytes.Equal(maskIntentionalFileEntryDiffs(data), maskIntentionalFileEntryDiffs(want)) {
 			for i := range want {
 				if data[i] != want[i] {
 					t.Fatalf("descriptor sector %d: first diff at offset %d: got %02x want %02x", lba, i, data[i], want[i])
@@ -175,6 +178,24 @@ func TestUdfDispersedParity(t *testing.T) {
 			t.Fatalf("golden sector %d is nonzero but DescriptorAt = false and it is not file data", lba)
 		}
 	}
+}
+
+// maskIntentionalFileEntryDiffs zeroes the bytes where the dispersed writer
+// deliberately differs from the contiguous one (uid/gid/permissions — copied
+// ownership and modes — plus the tag checksum/CRC they feed), so everything
+// else is still compared byte-for-byte.
+func maskIntentionalFileEntryDiffs(sector []byte) []byte {
+	if binary.LittleEndian.Uint16(sector[0:2]) != 261 { // file entry tag
+		return sector
+	}
+	masked := append([]byte(nil), sector...)
+	masked[4] = 0 // tag checksum
+	masked[8] = 0 // descriptor CRC
+	masked[9] = 0
+	for i := 36; i < 48; i++ { // uid, gid, permissions
+		masked[i] = 0
+	}
+	return masked
 }
 
 // udfDisperseTestAd is one parsed short allocation descriptor.
@@ -726,4 +747,76 @@ func TestUdfDispersedFindFile(t *testing.T) {
 			t.Fatalf("FindFile(%q) = %d, want not found", path, index)
 		}
 	}
+}
+
+// TestUdfDispersedOwnershipAndModes: the dispersed writer defaults ownership
+// to uid:gid 0:0 (root) and copies each node's permission bits from the
+// source; extras keep the historical read-only word.
+func TestUdfDispersedOwnershipAndModes(t *testing.T) {
+	root := t.TempDir()
+	write := func(name string, perm os.FileMode) {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, perm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("secret.txt", 0o600) // owner rw
+	write("script.sh", 0o755)  // rwxr-xr-x
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0o750); err != nil { // rwxr-x---
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o711); err != nil { // rwx--x--x
+		t.Fatal(err)
+	}
+	extras := []UdfExtraFile{{Name: "EXTRA.DAT", Size: 1, Fill: func() ([]byte, error) { return []byte("x"), nil }}}
+	plan, err := PrepareUdfDispersed(root, 4096, "MODES", 16, extras)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lba := plan.MetaEndLbaExclusive()
+	extents := map[int][]UdfFileExtent{}
+	for i := 0; i < plan.FileCount(); i++ {
+		sectors := uint32((plan.FileSize(i) + LogicalSectorBytes - 1) / LogicalSectorBytes)
+		if sectors > 0 {
+			extents[i] = []UdfFileExtent{{FileIndex: i, Offset: 0, Lba: lba, Sectors: sectors}}
+			lba += sectors
+		}
+	}
+	if err := plan.AssignExtents(extents); err != nil {
+		t.Fatal(err)
+	}
+	image := assembleDispersedImage(t, plan, func(int) []byte { return []byte("x") })
+
+	check := func(feLba uint32, wantPermissions uint32, label string) {
+		t.Helper()
+		sector := image[int(feLba)*LogicalSectorBytes:]
+		if binary.LittleEndian.Uint16(sector[0:2]) != 261 {
+			t.Fatalf("%s: entry at %d is not a file entry", label, feLba)
+		}
+		if got := binary.LittleEndian.Uint32(sector[36:40]); got != 0 {
+			t.Fatalf("%s: uid = %d, want 0", label, got)
+		}
+		if got := binary.LittleEndian.Uint32(sector[40:44]); got != 0 {
+			t.Fatalf("%s: gid = %d, want 0", label, got)
+		}
+		if got := binary.LittleEndian.Uint32(sector[44:48]); got != wantPermissions {
+			t.Fatalf("%s: permissions = %#x, want %#x", label, got, wantPermissions)
+		}
+	}
+
+	fsd := image[udfFirstPartitionLba*LogicalSectorBytes:]
+	rootFeLba := udfFirstPartitionLba + binary.LittleEndian.Uint32(fsd[404:408])
+	check(rootFeLba, 0x1c21, "root directory") // rwx--x--x
+	files := udfDisperseTestReadDir(t, image, rootFeLba)
+	check(files["secret.txt"], 0x1800, "secret.txt") // rw-------
+	check(files["script.sh"], 0x1ca5, "script.sh")   // rwxr-xr-x
+	check(files["sub"], 0x1ca0, "sub")               // rwxr-x---
+	check(files["EXTRA.DAT"], 0x1084, "EXTRA.DAT")   // extras stay read-only
 }
