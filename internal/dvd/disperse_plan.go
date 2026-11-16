@@ -47,6 +47,7 @@ type dispersePlan struct {
 	band        [2]byte
 	marginWhite float64
 	marginBlack float64
+	headroom    float64 // the effective capacity headroom the plan settled on
 }
 
 // dispersePlannerInputs carries everything the planner needs.
@@ -76,15 +77,19 @@ type continuousDemand struct {
 }
 
 // planDispersion computes the placement, widening the gray band and shrinking
-// margins until the data fits.
+// margins until the data fits. When even the widest band and smallest margins
+// lack the capacity, the headroom target relaxes toward 1.0 (packing the gray
+// areas tighter) and the search restarts from the initial narrow band — a
+// narrow band may suffice at the lower target, and fidelity beats slack.
 func planDispersion(in dispersePlannerInputs) (*dispersePlan, error) {
 	if in.headroom <= 0 {
 		in.headroom = 1.10
 	}
-	band := in.grayBand
-	if band[0] < 0 || band[1] < 0 || band[0] > band[1] {
-		band = [2]int{120, 136}
+	initialBand := in.grayBand
+	if initialBand[0] < 0 || initialBand[1] < 0 || initialBand[0] > initialBand[1] {
+		initialBand = [2]int{120, 136}
 	}
+	band := initialBand
 	marginWhite, marginBlack := in.marginWhite, in.marginBlack
 
 	fixedUsed := make([]bool, in.totalSectors)
@@ -119,10 +124,12 @@ func planDispersion(in dispersePlannerInputs) (*dispersePlan, error) {
 		}
 		fileSectorsTotal += uint64((size + 2047) / 2048)
 	}
-	needed := uint64(float64(fileSectorsTotal+continuousTotal) * in.headroom)
+	dataSectors := fileSectorsTotal + continuousTotal
+	headroom := in.headroom
+	needed := uint64(float64(dataSectors) * headroom)
 
 	var placementErr error
-	for attempt := 0; attempt < 100; attempt++ {
+	for attempt := 0; attempt < 400; attempt++ {
 		eligible := in.toneMap.classifySectors(byte(band[0]), byte(band[1]), marginWhite, marginBlack)
 		free := make([]bool, in.totalSectors)
 		count := uint64(0)
@@ -141,6 +148,7 @@ func planDispersion(in dispersePlannerInputs) (*dispersePlan, error) {
 				plan.eligible = free
 				plan.band = [2]byte{byte(band[0]), byte(band[1])}
 				plan.marginWhite, plan.marginBlack = marginWhite, marginBlack
+				plan.headroom = headroom
 				return plan, nil
 			}
 			switch err.(type) {
@@ -163,11 +171,21 @@ func planDispersion(in dispersePlannerInputs) (*dispersePlan, error) {
 			marginBlack *= 0.7
 			continue
 		}
+		// Last resort: relax the headroom target toward 1.0 and restart
+		// from the initial narrow band.
+		if headroom > 1.0 {
+			headroom = max(1.0, headroom-0.02)
+			needed = uint64(float64(dataSectors) * headroom)
+			band = initialBand
+			marginWhite, marginBlack = in.marginWhite, in.marginBlack
+			placementErr = nil
+			continue
+		}
 		if tooMany, ok := placementErr.(*tooManyExtentsError); ok {
 			return nil, fmt.Errorf("the picture's gray areas are too scattered for %s: it needs %d UDF allocation descriptors, but one file entry supports %d; use a picture with larger mid-tone or flat areas, or fewer files",
 				tooMany.path, tooMany.extents, iso.UdfMaxAllocationDescriptors)
 		}
-		return nil, fmt.Errorf("the picture's mid-tone and flat areas hold %d sectors, but the data needs %d (with headroom); use a picture with more tonal range or fewer files", count, needed)
+		return nil, fmt.Errorf("the picture's mid-tone and flat areas hold %d sectors, but the data alone needs %d; use a picture with more tonal range or fewer files", count, needed)
 	}
 	return nil, fmt.Errorf("placement failed")
 }

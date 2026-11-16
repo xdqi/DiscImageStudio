@@ -395,11 +395,15 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	fmt.Println()
 
 	resolvedBand := [2]int{int(plan.band[0]), int(plan.band[1])}
-	if err := writeDisperseSidecar(isoOutputPath, plan, udfPlan, bridgeLayer != nil, resolvedBand, marginWhite, marginBlack); err != nil {
+	if err := writeDisperseSidecar(isoOutputPath, plan, udfPlan, bridgeLayer != nil, resolvedBand, plan.marginWhite, plan.marginBlack); err != nil {
 		return err
 	}
-	fmt.Printf("done: dispersed UDF %s, files=%d, gray band=[%d,%d], output=%s\n",
-		filesystem, udfPlan.FileCount(), plan.band[0], plan.band[1], isoOutputPath)
+	headroomNote := ""
+	if plan.headroom != headroom {
+		headroomNote = fmt.Sprintf(", headroom relaxed to %.2f", plan.headroom)
+	}
+	fmt.Printf("done: dispersed UDF %s, files=%d, gray band=[%d,%d]%s, output=%s\n",
+		filesystem, udfPlan.FileCount(), plan.band[0], plan.band[1], headroomNote, isoOutputPath)
 	_ = summary
 	return nil
 }

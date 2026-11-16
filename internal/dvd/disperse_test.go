@@ -802,6 +802,48 @@ func TestPlanDispersionTooManyExtentsFatal(t *testing.T) {
 	}
 }
 
+// TestPlanDispersionRelaxesHeadroom: when even the widest band and smallest
+// margins lack the capacity for the full headroom, the planner relaxes the
+// headroom target toward 1.0 and restarts from the initial narrow band
+// (fidelity beats slack).
+func TestPlanDispersionRelaxesHeadroom(t *testing.T) {
+	const total = 4096
+	pattern := func(sector int) []byte {
+		if sector >= 500 && sector < 1500 { // one 1000-sector gray run
+			return solidLum(128)
+		}
+		return mixLum(250, 128) // never gray, never pure
+	}
+	tm := fakeDisperseToneMap(t, total, pattern)
+	in := dispersePlannerInputs{
+		totalSectors:   total,
+		fileSizes:      []int64{950 * 2048}, // fits at headroom 1.04, not 1.10
+		filePaths:      []string{"big.bin"},
+		headroom:       1.1,
+		grayBand:       [2]int{-1, -1},
+		marginWhite:    0.35,
+		marginBlack:    0.5,
+		toneMap:        tm,
+		reservedBefore: 300,
+		reservedAfter:  total - 257,
+	}
+	plan, err := planDispersion(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.headroom >= 1.1 || plan.headroom <= 1.0 {
+		t.Fatalf("headroom = %v, want a relaxed value in (1.0, 1.1)", plan.headroom)
+	}
+	// The search restarts from the initial narrow band after relaxing.
+	if plan.band != [2]byte{120, 136} {
+		t.Fatalf("band = [%d,%d], want the initial [120,136]", plan.band[0], plan.band[1])
+	}
+	list := plan.fileExtents[0]
+	if len(list) != 1 || list[0].sectors != 950 {
+		t.Fatalf("file extents = %+v, want one 950-sector extent", list)
+	}
+}
+
 // TestDispersedUdfBridgeLegacyEndToEnd: --legacy-boot-image writes the x86
 // legacy BIOS default entry (no-emulation, load size rounded up to 2 KiB)
 // and patches a Boot Information Table into the boot image's on-disc content
