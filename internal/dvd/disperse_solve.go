@@ -33,14 +33,15 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	if filesystem != "udf" && !bridge {
 		return newArgumentError("--filesystem must be udf or udf-bridge.")
 	}
-	var bootImagePath string
+	var bootImagePath, legacyBootImagePath string
 	if bridge {
-		bootImagePath, err = arguments.Require("boot-image")
-		if err != nil {
-			return err
+		bootImagePath = arguments.Get("boot-image", "")
+		legacyBootImagePath = arguments.Get("legacy-boot-image", "")
+		if bootImagePath == "" && legacyBootImagePath == "" {
+			return newArgumentError("--filesystem udf-bridge requires --boot-image or --legacy-boot-image.")
 		}
-	} else if arguments.Has("boot-image") {
-		return newArgumentError("--boot-image requires --filesystem udf-bridge.")
+	} else if arguments.Has("boot-image") || arguments.Has("legacy-boot-image") {
+		return newArgumentError("--boot-image and --legacy-boot-image require --filesystem udf-bridge.")
 	}
 	exposePaths := arguments.GetAll("expose")
 	if len(exposePaths) > 0 && !bridge {
@@ -99,16 +100,25 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	if err != nil {
 		return err
 	}
-	bootImageIndex := -1
+	bootImageIndex, legacyBootImageIndex := -1, -1
 	var exposed []iso.ExposedFile
 	var exposedIndexes []int
 	var extraDirs []string
 	if bridge {
-		index, found := udfPlan.FindFile(bootImagePath)
-		if !found {
-			return newArgumentError(fmt.Sprintf("--boot-image must name a regular file inside the data directory (path relative to the image root): %s", bootImagePath))
+		if bootImagePath != "" {
+			index, found := udfPlan.FindFile(bootImagePath)
+			if !found {
+				return newArgumentError(fmt.Sprintf("--boot-image must name a regular file inside the data directory (path relative to the image root): %s", bootImagePath))
+			}
+			bootImageIndex = index
 		}
-		bootImageIndex = index
+		if legacyBootImagePath != "" {
+			index, found := udfPlan.FindFile(legacyBootImagePath)
+			if !found {
+				return newArgumentError(fmt.Sprintf("--legacy-boot-image must name a regular file inside the data directory (path relative to the image root): %s", legacyBootImagePath))
+			}
+			legacyBootImageIndex = index
+		}
 		// --expose: a regular file, or a directory expanded recursively.
 		// Overlapping exposures are deduplicated by file index.
 		seen := map[int]bool{}
@@ -120,6 +130,11 @@ func solveDispersedUdf(arguments *cliArguments) error {
 			extraDirs = append(extraDirs, dirs...)
 			for _, file := range files {
 				if seen[file.Index] {
+					continue
+				}
+				// A boot image is already listed at its image path on the
+				// ISO9660 side; exposing it needs no second record.
+				if file.Index == bootImageIndex || file.Index == legacyBootImageIndex {
 					continue
 				}
 				seen[file.Index] = true
@@ -134,9 +149,18 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	metaEnd := udfPlan.MetaEndLbaExclusive()
 	totalSectors := imageMapping.TotalSectors
 	var bridgeLayer *iso.ElToritoBridge
+	var bootImageSize, legacyBootImageSize int64
 	if bridge {
+		if bootImageIndex >= 0 {
+			bootImageSize = udfPlan.FileSize(bootImageIndex)
+		}
+		if legacyBootImageIndex >= 0 {
+			legacyBootImageSize = udfPlan.FileSize(legacyBootImageIndex)
+		}
 		bridgeLayer, err = iso.NewElToritoBridge(totalSectors, volumeLabel,
-			strings.ReplaceAll(bootImagePath, "\\", "/"), udfPlan.FileSize(bootImageIndex), exposed, extraDirs)
+			strings.ReplaceAll(bootImagePath, "\\", "/"), bootImageSize,
+			strings.ReplaceAll(legacyBootImagePath, "\\", "/"), legacyBootImageSize,
+			exposed, extraDirs)
 		if err != nil {
 			return err
 		}
@@ -162,17 +186,27 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		}
 	}
 
-	// Planner: the boot image and every exposed file are continuous demands
+	// Planner: the boot images and every exposed file are continuous demands
 	// linked to their tree files; everything else is aggregate file data.
 	var continuous []continuousDemand
 	if bridge {
-		bootSectors := uint32((udfPlan.FileSize(bootImageIndex) + 2047) / 2048)
-		continuous = append(continuous, continuousDemand{
-			Role: "boot-image", Path: filepath.ToSlash(bootImagePath), Sectors: bootSectors,
-			FileIndex: bootImageIndex,
-		})
+		// The x86 legacy BIOS image first: it is the catalog's default entry.
+		if legacyBootImageIndex >= 0 {
+			continuous = append(continuous, continuousDemand{
+				Role: "legacy-boot-image", Path: filepath.ToSlash(legacyBootImagePath),
+				Sectors:   uint32((legacyBootImageSize + 2047) / 2048),
+				FileIndex: legacyBootImageIndex,
+			})
+		}
+		if bootImageIndex >= 0 && bootImageIndex != legacyBootImageIndex {
+			continuous = append(continuous, continuousDemand{
+				Role: "boot-image", Path: filepath.ToSlash(bootImagePath),
+				Sectors:   uint32((bootImageSize + 2047) / 2048),
+				FileIndex: bootImageIndex,
+			})
+		}
 		for i := range exposed {
-			if exposed[i].Size == 0 || exposedIndexes[i] == bootImageIndex {
+			if exposed[i].Size == 0 {
 				continue // an empty file has no extent (ISO9660 record LBA 0)
 			}
 			continuous = append(continuous, continuousDemand{
@@ -222,21 +256,25 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	}
 
 	// The El Torito / ISO9660 layer gets the planner-assigned LBAs.
+	var bootLba, legacyLba uint32
 	if bridge {
-		var bootLba uint32
 		byRole := map[string]uint32{}
 		for _, p := range plan.placed {
 			byRole[p.Role+"/"+p.Path] = p.Lba
 		}
-		bootLba = byRole["boot-image/"+filepath.ToSlash(bootImagePath)]
+		if legacyBootImageIndex >= 0 {
+			legacyLba = byRole["legacy-boot-image/"+filepath.ToSlash(legacyBootImagePath)]
+		}
+		if bootImageIndex >= 0 {
+			bootLba = byRole["boot-image/"+filepath.ToSlash(bootImagePath)]
+			if bootImageIndex == legacyBootImageIndex {
+				bootLba = legacyLba
+			}
+		}
 		exposedLbas := make([]uint32, len(exposed))
 		for i := range exposed {
 			if exposed[i].Size == 0 {
 				continue // empty file: no extent (ISO9660 record LBA 0)
-			}
-			if exposedIndexes[i] == bootImageIndex {
-				exposedLbas[i] = bootLba
-				continue
 			}
 			lba, ok := byRole["iso-expose/"+exposed[i].Path]
 			if !ok {
@@ -244,7 +282,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 			}
 			exposedLbas[i] = lba
 		}
-		if err := bridgeLayer.SetPlacements(bootLba, exposedLbas); err != nil {
+		if err := bridgeLayer.SetPlacements(bootLba, legacyLba, exposedLbas); err != nil {
 			return err
 		}
 	}
@@ -276,6 +314,16 @@ func solveDispersedUdf(arguments *cliArguments) error {
 			copy(buf, content[offset:])
 			return nil
 		},
+	}
+	// The legacy BIOS boot image gets its Boot Information Table patched into
+	// bytes 8..55 of its first sector (both UDF and the catalog share the
+	// extent, exactly like mkisofs does).
+	if bridge && legacyBootImageIndex >= 0 {
+		source.bootInfo = &bootInfoTablePatch{
+			fileIndex: legacyBootImageIndex,
+			lba:       legacyLba,
+			size:      legacyBootImageSize,
+		}
 	}
 	var extents []fileExtent
 	for _, list := range plan.fileExtents {

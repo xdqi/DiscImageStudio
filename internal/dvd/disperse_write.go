@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"time"
+
+	"disc-image-studio/internal/iso"
 )
 
 // sectorByteSource resolves the content of non-picture sectors.
@@ -26,6 +28,15 @@ type dispersedSectorSource struct {
 	files        map[int]*os.File
 	// readFileContent serves bytes for synthetic (path-less) files; may be nil.
 	readFileContent func(fileIndex int, offset int64, buf []byte) error
+	// bootInfo, when non-nil, patches a Boot Information Table into bytes
+	// 8..55 of that file's first sector (the x86 legacy BIOS boot image).
+	bootInfo *bootInfoTablePatch
+}
+
+type bootInfoTablePatch struct {
+	fileIndex int
+	lba       uint32
+	size      int64
 }
 
 func (s *dispersedSectorSource) Content(lba uint32) ([]byte, bool, error) {
@@ -62,18 +73,21 @@ func (s *dispersedSectorSource) Content(lba uint32) ([]byte, bool, error) {
 				if err := s.readFileContent(ext.fileIndex, offset, data); err != nil {
 					return nil, false, err
 				}
-				return data, true, nil
+			} else {
+				file, err := s.openFile(ext)
+				if err != nil {
+					return nil, false, err
+				}
+				n, err := file.ReadAt(data, offset)
+				if err != nil && err != io.EOF {
+					return nil, false, err
+				}
+				if n < 2048 && err != io.EOF {
+					return nil, false, fmt.Errorf("short read on %s", ext.filePath)
+				}
 			}
-			file, err := s.openFile(ext)
-			if err != nil {
-				return nil, false, err
-			}
-			n, err := file.ReadAt(data, offset)
-			if err != nil && err != io.EOF {
-				return nil, false, err
-			}
-			if n < 2048 && err != io.EOF {
-				return nil, false, fmt.Errorf("short read on %s", ext.filePath)
+			if s.bootInfo != nil && ext.fileIndex == s.bootInfo.fileIndex && offset == 0 {
+				iso.PatchBootInfoTable(data, s.bootInfo.lba, s.bootInfo.size)
 			}
 			return data, true, nil
 		}

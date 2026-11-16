@@ -52,9 +52,12 @@ type ElToritoBridge struct {
 	volumeLabel   string
 	timestamp     time.Time
 
-	bootImageName string
+	bootImageName string // the EFI boot image's image-root-relative path
 	bootImageSize int64
 	bootNode      *isoNode
+	legacyPath    string // the x86 legacy BIOS boot image's path
+	legacySize    int64
+	legacyNode    *isoNode
 	catalogNode   *isoNode
 	exposed       []ExposedFile
 	exposedNodes  []*isoNode
@@ -68,31 +71,50 @@ type ElToritoBridge struct {
 	jolietPathTableSectors uint32
 	catalogLba             uint32
 
-	bootImageLba  uint32
+	bootImageLba  uint32 // EFI image extent
+	legacyBootLba uint32 // x86 legacy BIOS image extent
 	placementsSet bool
 	sectors       map[uint32][]byte
 }
 
 // NewElToritoBridge creates the layer. volumeSectors is the total image size
-// in 2048-byte sectors. bootImageName is its image-root-relative path.
-// bootImageSize is its size in bytes. exposed lists data files to list
-// in the ISO9660 tree at their image paths; extraDirs lists directories to
-// create even when they would otherwise be empty (directory expansion of
-// --expose). The timestamp follows the iso package's nowFunc convention
-// (time.Now().UTC()).
+// in 2048-byte sectors. Boot images are image-root-relative paths:
+// bootImageName is the EFI boot entry, legacyBootImagePath the x86 legacy
+// BIOS entry (no-emulation, BootInfoTable patched into its on-disc content);
+// at least one is required, and when both exist the legacy entry appears
+// before the EFI section in the El Torito catalog. exposed lists data files
+// to list in the ISO9660 tree at their image paths; extraDirs lists
+// directories to create even when they would otherwise be empty (directory
+// expansion of --expose). The timestamp follows the iso package's nowFunc
+// convention (time.Now().UTC()).
 func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName string, bootImageSize int64,
-	exposed []ExposedFile, extraDirs []string) (*ElToritoBridge, error) {
+	legacyBootImagePath string, legacyBootImageSize int64, exposed []ExposedFile, extraDirs []string) (*ElToritoBridge, error) {
 	if volumeSectors <= 25 {
 		return nil, fmt.Errorf("UDF bridge volume of %d sectors is too small for the ISO9660/El Torito layer (sectors through %d). (Parameter 'volumeSectors')",
 			volumeSectors, 25)
 	}
-	if bootImageSize <= 0 || bootImageSize > maxBootImageBytes {
-		return nil, fmt.Errorf("Boot image size must be between 1 byte and %d. (Parameter 'bootImageSize')",
-			maxBootImageBytes)
+	checkBootImage := func(path string, size int64, param string) error {
+		if path == "" {
+			return nil
+		}
+		if size <= 0 || size > maxBootImageBytes {
+			return fmt.Errorf("Boot image size must be between 1 byte and %d. (Parameter '%s')",
+				maxBootImageBytes, param)
+		}
+		if normalizePrimaryIdentifier(path, maximumPrimaryIdentifierCharacters-2, "") == "" {
+			return fmt.Errorf("Boot image path does not normalize to an ISO9660 primary identifier: %s (Parameter '%s')",
+				path, param)
+		}
+		return nil
 	}
-	if normalizePrimaryIdentifier(bootImageName, maximumPrimaryIdentifierCharacters-2, "") == "" {
-		return nil, fmt.Errorf("Boot image name does not normalize to an ISO9660 primary identifier: %s (Parameter 'bootImageName')",
-			bootImageName)
+	if err := checkBootImage(bootImageName, bootImageSize, "bootImageName"); err != nil {
+		return nil, err
+	}
+	if err := checkBootImage(legacyBootImagePath, legacyBootImageSize, "legacyBootImagePath"); err != nil {
+		return nil, err
+	}
+	if bootImageName == "" && legacyBootImagePath == "" {
+		return nil, errors.New("The bridge needs at least one boot image (EFI or x86 legacy BIOS).")
 	}
 	b := &ElToritoBridge{
 		volumeSectors: volumeSectors,
@@ -100,6 +122,8 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 		timestamp:     nowFunc(),
 		bootImageName: bootImageName,
 		bootImageSize: bootImageSize,
+		legacyPath:    legacyBootImagePath,
+		legacySize:    legacyBootImageSize,
 		exposed:       append([]ExposedFile(nil), exposed...),
 	}
 
@@ -135,49 +159,63 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 		}
 		return current, nil
 	}
-	for _, dir := range extraDirs {
-		if _, err := mkdir(dir); err != nil {
-			return nil, err
+	// File leaves are shared by clean path: exposing the boot image's path
+	// (or giving both boot flags the same path) must not duplicate nodes.
+	fileNodes := map[string]*isoNode{}
+	addFile := func(path string, size int64) (*isoNode, error) {
+		clean := cleanImagePath(path)
+		if node, ok := fileNodes[clean]; ok {
+			if node.dataLength != size {
+				return nil, fmt.Errorf("The file has conflicting sizes: %s (Parameter 'exposed')", path)
+			}
+			return node, nil
 		}
-	}
-	bootParts := splitImagePath(bootImageName)
-	if len(bootParts) == 0 || bootParts[len(bootParts)-1] == ".." {
-		return nil, fmt.Errorf("Invalid boot image path: %s", bootImageName)
-	}
-	bootParent, err := mkdir(strings.Join(bootParts[:len(bootParts)-1], "/"))
-	if err != nil {
-		return nil, err
-	}
-	b.bootNode = &isoNode{name: bootParts[len(bootParts)-1], dataLength: bootImageSize, timestamp: b.timestamp, parent: bootParent}
-	bootParent.children = append(bootParent.children, b.bootNode)
-	for i := range b.exposed {
-		components := splitImagePath(b.exposed[i].Path)
-		if len(components) == 0 {
-			return nil, fmt.Errorf("The exposed path is empty. (Parameter 'exposed')")
+		components := splitImagePath(clean)
+		if len(components) == 0 || components[len(components)-1] == ".." {
+			return nil, fmt.Errorf("Invalid file path: %s (Parameter 'exposed')", path)
 		}
-		if b.exposed[i].Size < 0 {
-			return nil, fmt.Errorf("The exposed file size cannot be negative: %s (Parameter 'exposed')", b.exposed[i].Path)
-		}
-		var parent *isoNode
+		parent := root
 		var err error
 		if len(components) > 1 {
 			parent, err = mkdir(strings.Join(components[:len(components)-1], "/"))
 			if err != nil {
 				return nil, err
 			}
-		} else {
-			parent = root
 		}
-		if cleanImagePath(b.exposed[i].Path) == cleanImagePath(bootImageName) {
-			if b.exposed[i].Size != bootImageSize {
-				return nil, fmt.Errorf("Boot image size mismatch: %s", bootImageName)
-			}
-			b.exposedNodes = append(b.exposedNodes, b.bootNode)
-			continue
-		}
-		leaf := &isoNode{name: components[len(components)-1], dataLength: b.exposed[i].Size, timestamp: b.timestamp, parent: parent}
+		leaf := &isoNode{name: components[len(components)-1], dataLength: size, timestamp: b.timestamp, parent: parent}
 		parent.children = append(parent.children, leaf)
-		b.exposedNodes = append(b.exposedNodes, leaf)
+		fileNodes[clean] = leaf
+		return leaf, nil
+	}
+
+	for _, dir := range extraDirs {
+		if _, err := mkdir(dir); err != nil {
+			return nil, err
+		}
+	}
+	if legacyBootImagePath != "" {
+		node, err := addFile(legacyBootImagePath, legacyBootImageSize)
+		if err != nil {
+			return nil, err
+		}
+		b.legacyNode = node
+	}
+	if bootImageName != "" {
+		node, err := addFile(bootImageName, bootImageSize)
+		if err != nil {
+			return nil, err
+		}
+		b.bootNode = node
+	}
+	for i := range b.exposed {
+		if b.exposed[i].Size < 0 {
+			return nil, fmt.Errorf("The exposed file size cannot be negative: %s (Parameter 'exposed')", b.exposed[i].Path)
+		}
+		node, err := addFile(b.exposed[i].Path, b.exposed[i].Size)
+		if err != nil {
+			return nil, err
+		}
+		b.exposedNodes = append(b.exposedNodes, node)
 	}
 
 	directories, err := isoAssignDirectoryNumbers(root)
@@ -238,16 +276,24 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 	return b, nil
 }
 
-// SetPlacements records the planner-assigned LBAs of the boot image and the
+// SetPlacements records the planner-assigned LBAs of the boot images and the
 // exposed files (in the constructor's order) and renders the layer's
-// sectors. Every file's extent must be contiguous.
-func (b *ElToritoBridge) SetPlacements(bootImageLba uint32, exposedLbas []uint32) error {
+// sectors. Every file's extent must be contiguous. Absent boot images take
+// LBA 0.
+func (b *ElToritoBridge) SetPlacements(bootImageLba uint32, legacyBootImageLba uint32, exposedLbas []uint32) error {
 	if len(exposedLbas) != len(b.exposedNodes) {
 		return fmt.Errorf("Got %d exposed-file LBAs for %d exposed files. (Parameter 'exposedLbas')",
 			len(exposedLbas), len(b.exposedNodes))
 	}
-	if err := b.checkPlacement(bootImageLba, "bootImageLba"); err != nil {
-		return err
+	if b.bootNode != nil {
+		if err := b.checkPlacement(bootImageLba, "bootImageLba"); err != nil {
+			return err
+		}
+	}
+	if b.legacyNode != nil {
+		if err := b.checkPlacement(legacyBootImageLba, "legacyBootImageLba"); err != nil {
+			return err
+		}
 	}
 	for i, lba := range exposedLbas {
 		if b.exposed[i].Size == 0 {
@@ -262,10 +308,19 @@ func (b *ElToritoBridge) SetPlacements(bootImageLba uint32, exposedLbas []uint32
 		if b.exposedNodes[i] == b.bootNode && lba != bootImageLba {
 			return fmt.Errorf("Exposed boot image must share its boot LBA")
 		}
+		if b.exposedNodes[i] == b.legacyNode && lba != legacyBootImageLba {
+			return fmt.Errorf("Exposed legacy boot image must share its boot LBA")
+		}
 		b.exposedNodes[i].dataLba = lba
 	}
 	b.bootImageLba = bootImageLba
-	b.bootNode.dataLba = bootImageLba
+	if b.bootNode != nil {
+		b.bootNode.dataLba = bootImageLba
+	}
+	b.legacyBootLba = legacyBootImageLba
+	if b.legacyNode != nil {
+		b.legacyNode.dataLba = legacyBootImageLba
+	}
 	b.placementsSet = true
 	b.sectors = b.buildSectors()
 	return nil
@@ -398,7 +453,10 @@ func buildBootRecordDescriptor(catalogLba uint32) []byte {
 }
 
 // buildBootCatalog is the one-sector El Torito boot catalog: a validation
-// entry followed by the initial/default (no-emulation) entry.
+// entry, then the x86 legacy BIOS default entry when present, then the EFI
+// section (the legacy entry always appears before the EFI one). With only an
+// EFI image the entry takes the default position and the validation entry's
+// platform is 0xEF (xorriso's EFI-only layout).
 func (b *ElToritoBridge) buildBootCatalog() []byte {
 	sector := make([]byte, LogicalSectorBytes)
 
@@ -406,6 +464,9 @@ func (b *ElToritoBridge) buildBootCatalog() []byte {
 	// reserved word and the empty ID string, all zero.
 	sector[0] = 1 // header ID
 	sector[1] = 0 // platform ID: 80x86
+	if b.legacyNode == nil {
+		sector[1] = 0xEF // platform ID: EFI (EFI-only catalog)
+	}
 	sector[30] = 0x55
 	sector[31] = 0xAA
 	// Checksum word at bytes 28..29: the 16 little-endian words of the
@@ -416,13 +477,50 @@ func (b *ElToritoBridge) buildBootCatalog() []byte {
 	}
 	binary.LittleEndian.PutUint16(sector[28:], -sum)
 
-	// Initial/Default entry at bytes 32..63.
-	sector[32] = 0x88 // bootable
-	sector[33] = 0    // boot media type: no emulation
-	// Bytes 34..35: load segment 0 (BIOS default 0x7C0).
-	// Byte 36: system type, a copy of the PVD's (0); byte 37: unused.
-	sectorCount := uint16((b.bootImageSize + 511) / 512) // in 512-byte units
-	binary.LittleEndian.PutUint16(sector[38:], sectorCount)
-	binary.LittleEndian.PutUint32(sector[40:], b.bootImageLba)
+	offset := 32
+	writeEntry := func(lba uint32, loadSectors uint16) {
+		sector[offset] = 0x88 // bootable
+		sector[offset+1] = 0  // boot media type: no emulation
+		// Load segment 0 (BIOS default 0x7C0); system type 0.
+		binary.LittleEndian.PutUint16(sector[offset+6:], loadSectors)
+		binary.LittleEndian.PutUint32(sector[offset+8:], lba)
+	}
+	if b.legacyNode != nil {
+		// x86 legacy BIOS default entry: no-emulation, BootInfoTable, and
+		// the load size rounded up to 2 KiB (4 sectors of 512 bytes each).
+		writeEntry(b.legacyBootLba, uint16((b.legacySize+LogicalSectorBytes-1)/LogicalSectorBytes)*4)
+		offset += 32
+	}
+	if b.bootNode != nil {
+		if b.legacyNode != nil {
+			// Section header: final (0x91), platform 0xEF (EFI), one entry.
+			sector[offset] = 0x91
+			sector[offset+1] = 0xEF
+			binary.LittleEndian.PutUint16(sector[offset+2:], 1)
+			offset += 32
+		}
+		writeEntry(b.bootImageLba, uint16((b.bootImageSize+511)/512)) // 512-byte units
+		offset += 32
+	}
 	return sector
+}
+
+// PatchBootInfoTable writes the El Torito Boot Information Table of a legacy
+// BIOS no-emulation boot image into bytes 8..55 of its first 2048-byte
+// sector: bi_pvd (LBA of the Primary Volume Descriptor), bi_file (the boot
+// image's LBA), bi_length (image size in bytes), and bi_csum (the sum of all
+// little-endian uint32 words of bytes 64..2047, computed over the unpatched
+// content). The reserved bytes 24..55 are zeroed.
+func PatchBootInfoTable(firstSector []byte, fileLba uint32, imageSize int64) {
+	for i := 8; i < 56; i++ {
+		firstSector[i] = 0
+	}
+	binary.LittleEndian.PutUint32(firstSector[8:], primaryVolumeDescriptorLba)
+	binary.LittleEndian.PutUint32(firstSector[12:], fileLba)
+	binary.LittleEndian.PutUint32(firstSector[16:], uint32(imageSize))
+	var sum uint32
+	for i := 64; i < LogicalSectorBytes; i += 4 {
+		sum += binary.LittleEndian.Uint32(firstSector[i:])
+	}
+	binary.LittleEndian.PutUint32(firstSector[20:], sum)
 }

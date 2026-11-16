@@ -14,11 +14,11 @@ import (
 // with a 4 KiB boot image planned at LBA 300 and nothing exposed.
 func newTestBridge(t *testing.T) *ElToritoBridge {
 	t.Helper()
-	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, nil, nil)
+	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, "", 0, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bridge.SetPlacements(300, nil); err != nil {
+	if err := bridge.SetPlacements(300, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	return bridge
@@ -113,8 +113,8 @@ func TestElToritoBridgeCatalog(t *testing.T) {
 	if sum != 0 {
 		t.Fatalf("validation entry checksum sum = %#x, want 0", sum)
 	}
-	if catalog[0] != 1 || catalog[1] != 0 {
-		t.Fatalf("validation entry header/platform = %#x/%#x, want 1/0", catalog[0], catalog[1])
+	if catalog[0] != 1 || catalog[1] != 0xEF {
+		t.Fatalf("validation entry header/platform = %#x/%#x, want 1/0xEF (EFI-only)", catalog[0], catalog[1])
 	}
 	if catalog[30] != 0x55 || catalog[31] != 0xAA {
 		t.Fatalf("validation entry signature = %#02x %#02x, want 55 aa", catalog[30], catalog[31])
@@ -205,20 +205,20 @@ func TestElToritoBridgeAccessors(t *testing.T) {
 }
 
 func TestElToritoBridgeValidation(t *testing.T) {
-	if _, err := NewElToritoBridge(25, "TEST", "boot.img", 4096, nil, nil); err == nil {
+	if _, err := NewElToritoBridge(25, "TEST", "boot.img", 4096, "", 0, nil, nil); err == nil {
 		t.Fatal("volumeSectors 25: want error")
 	}
-	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 0, nil, nil); err == nil {
+	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 0, "", 0, nil, nil); err == nil {
 		t.Fatal("bootImageSize 0: want error")
 	}
-	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", maxBootImageBytes+1, nil, nil); err == nil {
+	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", maxBootImageBytes+1, "", 0, nil, nil); err == nil {
 		t.Fatal("bootImageSize > 8 GiB: want error")
 	}
-	if _, err := NewElToritoBridge(4096, "TEST", "...", 4096, nil, nil); err == nil {
+	if _, err := NewElToritoBridge(4096, "TEST", "...", 4096, "", 0, nil, nil); err == nil {
 		t.Fatal("boot image name normalizing to empty: want error")
 	}
 
-	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, nil, nil)
+	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, "", 0, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,11 +226,11 @@ func TestElToritoBridgeValidation(t *testing.T) {
 		t.Fatal("SectorContent before SetPlacements: want error")
 	}
 	for _, lba := range []uint32{0, 24, 4096, 5000} {
-		if err := bridge.SetPlacements(lba, nil); err == nil {
+		if err := bridge.SetPlacements(lba, 0, nil); err == nil {
 			t.Fatalf("SetPlacements(%d): want error", lba)
 		}
 	}
-	if err := bridge.SetPlacements(300, nil); err != nil {
+	if err := bridge.SetPlacements(300, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -262,19 +262,20 @@ func TestElToritoBridgeXorriso(t *testing.T) {
 	if !strings.Contains(text, fmt.Sprintf("El Torito catalog  : %d", bridge.catalogLba)) {
 		t.Fatalf("xorriso did not report the boot catalog:\n%s", text)
 	}
-	// The boot image line must report a BIOS no-emulation entry with the
-	// 4 KiB size (8 512-byte sectors) at the boot image LBA.
+	// The boot image line must report a UEFI no-emulation entry with the
+	// 4 KiB size (8 512-byte sectors) at the boot image LBA (the bridge's
+	// --boot-image entry is the EFI one).
 	bootLine := ""
 	for _, line := range strings.Split(text, "\n") {
 		if strings.Contains(line, "El Torito boot img") {
 			bootLine = line
 		}
 	}
-	if bootLine == "" || !strings.Contains(bootLine, "BIOS") ||
+	if bootLine == "" || !strings.Contains(bootLine, "UEFI") ||
 		!strings.Contains(bootLine, "none") ||
 		!strings.Contains(bootLine, " 8 ") ||
 		!strings.Contains(bootLine, " 300") {
-		t.Fatalf("xorriso did not report the no-emulation boot entry at LBA 300:\n%s", text)
+		t.Fatalf("xorriso did not report the UEFI no-emulation boot entry at LBA 300:\n%s", text)
 	}
 }
 
@@ -282,13 +283,13 @@ func TestElToritoBridgeXorriso(t *testing.T) {
 // side gets a directory /A holding BAR;1 and a subdirectory B holding BARZ;1.
 func TestElToritoBridgeExposedTree(t *testing.T) {
 	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096,
-		[]ExposedFile{{Path: "a/bar", Size: 100}, {Path: "a/b/barz", Size: 200}}, nil)
+		"", 0, []ExposedFile{{Path: "a/bar", Size: 100}, {Path: "a/b/barz", Size: 200}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Layout: path table @22 (3 entries × 10 bytes → 1 sector), then the
 	// directory extents in path-table order (root@23, A@24, B@25), catalog@26.
-	if err := bridge.SetPlacements(300, []uint32{400, 500}); err != nil {
+	if err := bridge.SetPlacements(300, 0, []uint32{400, 500}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -375,20 +376,20 @@ func TestElToritoBridgeExposedTree(t *testing.T) {
 // trees are rejected.
 func TestElToritoBridgeExposedValidation(t *testing.T) {
 	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096,
-		[]ExposedFile{{Path: "a/../b", Size: 1}}, nil); err == nil {
+		"", 0, []ExposedFile{{Path: "a/../b", Size: 1}}, nil); err == nil {
 		t.Fatal("path with '..': want error")
 	}
 	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096,
-		[]ExposedFile{{Path: "", Size: 1}}, nil); err == nil {
+		"", 0, []ExposedFile{{Path: "", Size: 1}}, nil); err == nil {
 		t.Fatal("empty path: want error")
 	}
 	// An empty exposed file is allowed; its record carries extent LBA 0.
 	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096,
-		[]ExposedFile{{Path: "empty.bin", Size: 0}}, nil)
+		"", 0, []ExposedFile{{Path: "empty.bin", Size: 0}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bridge.SetPlacements(300, []uint32{0}); err != nil {
+	if err := bridge.SetPlacements(300, 0, []uint32{0}); err != nil {
 		t.Fatal(err)
 	}
 	records := parseDirRecords(t, mustBridgeSector(t, bridge, bridge.root.primaryDirectoryLba))
@@ -396,7 +397,7 @@ func TestElToritoBridgeExposedValidation(t *testing.T) {
 	if last.id != "EMPTY.BIN;1" || last.lba != 0 || last.size != 0 {
 		t.Fatalf("empty file record = %+v", last)
 	}
-	if err := bridge.SetPlacements(300, []uint32{400}); err == nil {
+	if err := bridge.SetPlacements(300, 0, []uint32{400}); err == nil {
 		t.Fatal("nonzero LBA for an empty file: want error")
 	}
 	// Too many directories: the tree must end before the anchor at 256.
@@ -404,7 +405,140 @@ func TestElToritoBridgeExposedValidation(t *testing.T) {
 	for i := 0; i < 250; i++ {
 		many = append(many, ExposedFile{Path: fmt.Sprintf("d%03d/f", i), Size: 1})
 	}
-	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, many, nil); err == nil {
+	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, "", 0, many, nil); err == nil {
 		t.Fatal("250 directories: want error (anchor at 256)")
+	}
+}
+
+// TestElToritoBridgeLegacyCatalog: with only a legacy BIOS image the catalog
+// is [validation(x86), default entry] with the load size rounded up to 2 KiB.
+func TestElToritoBridgeLegacyCatalog(t *testing.T) {
+	bridge, err := NewElToritoBridge(4096, "TEST", "", 0, "boot/loader.bin", 2500, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.SetPlacements(0, 300, nil); err != nil {
+		t.Fatal(err)
+	}
+	catalog := mustBridgeSector(t, bridge, bridge.catalogLba)
+	if catalog[0] != 1 || catalog[1] != 0 {
+		t.Fatalf("validation entry header/platform = %#x/%#x, want 1/0 (x86)", catalog[0], catalog[1])
+	}
+	entry := catalog[32:64]
+	if entry[0] != 0x88 || entry[1] != 0 {
+		t.Fatalf("legacy entry indicator/media = %#x/%#x, want 0x88/0 (no emulation)", entry[0], entry[1])
+	}
+	// 2500 bytes -> 2 sectors of 2048 -> 8 sectors of 512 (rounded up to 2 KiB).
+	if got := binary.LittleEndian.Uint16(entry[6:8]); got != 8 {
+		t.Fatalf("legacy entry load size = %d, want 8 (2 KiB rounding)", got)
+	}
+	if got := binary.LittleEndian.Uint32(entry[8:12]); got != 300 {
+		t.Fatalf("legacy entry LBA = %d, want 300", got)
+	}
+	for i, v := range catalog[64:] {
+		if v != 0 {
+			t.Fatalf("catalog byte %d beyond the default entry = %#x, want 0 (no EFI section)", 64+i, v)
+		}
+	}
+}
+
+// TestElToritoBridgeBothCatalog: with both images the catalog is [validation
+// (x86), legacy BIOS default entry, 0x91 section header (platform 0xEF, one
+// entry), EFI entry] — the legacy entry always precedes the EFI one.
+func TestElToritoBridgeBothCatalog(t *testing.T) {
+	bridge, err := NewElToritoBridge(4096, "TEST", "efi.img", 1024, "bios.img", 2500, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.SetPlacements(300, 400, nil); err != nil {
+		t.Fatal(err)
+	}
+	catalog := mustBridgeSector(t, bridge, bridge.catalogLba)
+	if catalog[0] != 1 || catalog[1] != 0 {
+		t.Fatalf("validation entry header/platform = %#x/%#x, want 1/0 (x86)", catalog[0], catalog[1])
+	}
+	legacy := catalog[32:64]
+	if legacy[0] != 0x88 || legacy[1] != 0 {
+		t.Fatalf("legacy entry indicator/media = %#x/%#x", legacy[0], legacy[1])
+	}
+	if got := binary.LittleEndian.Uint16(legacy[6:8]); got != 8 {
+		t.Fatalf("legacy load size = %d, want 8 (2500 bytes rounded up to 2 KiB)", got)
+	}
+	if got := binary.LittleEndian.Uint32(legacy[8:12]); got != 400 {
+		t.Fatalf("legacy LBA = %d, want 400", got)
+	}
+	header := catalog[64:96]
+	if header[0] != 0x91 || header[1] != 0xEF {
+		t.Fatalf("section header = %#x/%#x, want 0x91/0xEF (final, EFI)", header[0], header[1])
+	}
+	if got := binary.LittleEndian.Uint16(header[2:4]); got != 1 {
+		t.Fatalf("section entry count = %d, want 1", got)
+	}
+	efi := catalog[96:128]
+	if efi[0] != 0x88 || efi[1] != 0 {
+		t.Fatalf("EFI entry indicator/media = %#x/%#x", efi[0], efi[1])
+	}
+	if got := binary.LittleEndian.Uint16(efi[6:8]); got != 2 {
+		t.Fatalf("EFI load size = %d, want 2 (1024 bytes in 512-byte units)", got)
+	}
+	if got := binary.LittleEndian.Uint32(efi[8:12]); got != 300 {
+		t.Fatalf("EFI LBA = %d, want 300", got)
+	}
+	for i, v := range catalog[128:] {
+		if v != 0 {
+			t.Fatalf("catalog byte %d beyond the EFI entry = %#x, want 0", 128+i, v)
+		}
+	}
+}
+
+// TestElToritoBridgeBootImageRequired: at least one boot image is required.
+func TestElToritoBridgeBootImageRequired(t *testing.T) {
+	if _, err := NewElToritoBridge(4096, "TEST", "", 0, "", 0, nil, nil); err == nil {
+		t.Fatal("no boot image: want error")
+	}
+	if _, err := NewElToritoBridge(4096, "TEST", "", 0, "bios.img", 0, nil, nil); err == nil {
+		t.Fatal("empty legacy boot image: want error")
+	}
+}
+
+// TestPatchBootInfoTable: the table lands in bytes 8..55 with the PVD/file
+// LBAs, the image length and the checksum of bytes 64..2047; everything else
+// stays untouched.
+func TestPatchBootInfoTable(t *testing.T) {
+	sector := make([]byte, LogicalSectorBytes)
+	for i := range sector {
+		sector[i] = byte(i)
+	}
+	var want uint32
+	for i := 64; i < LogicalSectorBytes; i += 4 {
+		want += binary.LittleEndian.Uint32(sector[i:])
+	}
+	PatchBootInfoTable(sector, 300, 1500)
+	if got := binary.LittleEndian.Uint32(sector[8:12]); got != primaryVolumeDescriptorLba {
+		t.Fatalf("bi_pvd = %d, want %d", got, primaryVolumeDescriptorLba)
+	}
+	if got := binary.LittleEndian.Uint32(sector[12:16]); got != 300 {
+		t.Fatalf("bi_file = %d, want 300", got)
+	}
+	if got := binary.LittleEndian.Uint32(sector[16:20]); got != 1500 {
+		t.Fatalf("bi_length = %d, want 1500", got)
+	}
+	if got := binary.LittleEndian.Uint32(sector[20:24]); got != want {
+		t.Fatalf("bi_csum = %#x, want %#x", got, want)
+	}
+	for i := 24; i < 56; i++ {
+		if sector[i] != 0 {
+			t.Fatalf("reserved byte %d = %#x, want 0", i, sector[i])
+		}
+	}
+	for i := 0; i < 8; i++ {
+		if sector[i] != byte(i) {
+			t.Fatalf("byte %d (before the table) was modified", i)
+		}
+	}
+	for i := 56; i < LogicalSectorBytes; i++ {
+		if sector[i] != byte(i) {
+			t.Fatalf("byte %d (after the table) was modified", i)
+		}
 	}
 }

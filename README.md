@@ -24,14 +24,20 @@ mid-gray to the eye), so the files are invisible in the burned picture.
   --total-sectors 2297888 --data-dir ./files --filesystem udf
 ```
 
-`--filesystem udf-bridge --boot-image boot/loader.bin` adds an ISO9660 and
-Joliet-long bridge with an El Torito boot catalog (BIOS, no-emulation). The
-boot path is relative to `--data-dir` and appears at the same path in both
-filesystems. Repeat `--expose PATH` to expose other files or directories
-recursively; their parent directories are included. Exposed files and the boot
-image occupy continuous extents shared with UDF. Joliet-long preserves names
-up to 103 UTF-16 code units; the primary ISO9660 view uses normalized names.
-Names that cannot be represented in Joliet are rejected rather than renamed.
+`--filesystem udf-bridge --boot-image efi/efi.img` adds an ISO9660 and
+Joliet-long bridge with an El Torito boot catalog. `--boot-image` is the EFI
+entry: a FAT disk image containing the EFI executable (e.g.
+`\EFI\BOOT\BOOTX64.EFI`). `--legacy-boot-image bios/loader.bin` instead gives
+an x86 legacy BIOS entry: no-emulation, a Boot Information Table patched into
+bytes 8..55 of its on-disc content, and the load size rounded up to 2 KiB —
+the BIOS entry always appears before the EFI one; both may be given. Boot
+paths are relative to `--data-dir` and appear at the same path in both
+filesystems.
+Repeat `--expose PATH` to expose other files or directories recursively;
+their parent directories are included. Exposed files and boot images occupy
+continuous extents shared with UDF. Joliet-long preserves names up to 103
+UTF-16 code units; the primary ISO9660 view uses normalized names. Names that
+cannot be represented in Joliet are rejected rather than renamed.
 
 Knobs: `--gray-band T1:T2` (manual luminance band; default widens from
 120:136 until capacity fits), `--interior-margin`/`--interior-margin-black`

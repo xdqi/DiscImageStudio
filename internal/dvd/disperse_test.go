@@ -795,3 +795,150 @@ func TestPlanDispersionTooManyExtentsFatal(t *testing.T) {
 		t.Fatalf("error %q should name the file and its descriptor count", err)
 	}
 }
+
+// TestDispersedUdfBridgeLegacyEndToEnd: --legacy-boot-image writes the x86
+// legacy BIOS default entry (no-emulation, load size rounded up to 2 KiB)
+// and patches a Boot Information Table into the boot image's on-disc content
+// (bytes 8..55), shared by UDF and the catalog.
+func TestDispersedUdfBridgeLegacyEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	pngPath := writeGradientPng(t, filepath.Join(dir, "gradient.png"), 64)
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "boot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loader := make([]byte, 3000)
+	for i := range loader {
+		loader[i] = byte(i*17 + 3)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "boot", "loader.bin"), loader, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "hello.txt"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	isoPath := filepath.Join(dir, "disc.iso")
+	code := RunCommand([]string{
+		"solve", "--image", pngPath, "--iso-output", isoPath,
+		"--total-sectors", "4096", "--data-dir", dataDir,
+		"--filesystem", "udf-bridge", "--legacy-boot-image", "boot/loader.bin",
+	})
+	if code != 0 {
+		t.Fatalf("solve exited %d", code)
+	}
+	data, err := os.ReadFile(isoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sector = 2048
+
+	// Catalog (dynamically placed; the boot record at 17 carries its LBA).
+	catalogLba := binary.LittleEndian.Uint32(data[17*sector+71:])
+	catalog := data[int(catalogLba)*sector:]
+	if catalog[0] != 1 || catalog[1] != 0 {
+		t.Fatalf("validation entry header/platform = %#x/%#x, want 1/0 (x86)", catalog[0], catalog[1])
+	}
+	entry := catalog[32:64]
+	if entry[0] != 0x88 || entry[1] != 0 {
+		t.Fatalf("legacy entry = %#x/%#x, want 0x88/0 (bootable, no emulation)", entry[0], entry[1])
+	}
+	// 3000 bytes -> 2 KiB-rounded load size: 2 sectors of 2048 -> 8 of 512.
+	if got := binary.LittleEndian.Uint16(entry[6:8]); got != 8 {
+		t.Fatalf("legacy load size = %d, want 8 (2 KiB rounding)", got)
+	}
+	bootLba := binary.LittleEndian.Uint32(entry[8:12])
+
+	// The legacy image's UDF entry: a single contiguous extent at that LBA.
+	v := newUdfTestVolume(t, data)
+	fe := v.findFileEntry("loader.bin")
+	if fe == nil {
+		t.Fatal("loader.bin not found in the UDF tree")
+	}
+	if got := binary.LittleEndian.Uint32(fe[172:176]); got != 8 {
+		t.Fatalf("legacy boot image has %d AD bytes, want 8 (one extent)", got)
+	}
+	extentLbn := binary.LittleEndian.Uint32(fe[180:184])
+	if v.partitionStart+uint64(extentLbn) != uint64(bootLba) {
+		t.Fatalf("UDF extent LBA %d != catalog LBA %d", v.partitionStart+uint64(extentLbn), bootLba)
+	}
+
+	// The Boot Information Table is patched into the on-disc first sector;
+	// everything outside bytes 8..55 matches the source.
+	onDisc := data[int(bootLba)*sector : int(bootLba+1)*sector]
+	if !bytes.Equal(onDisc[:8], loader[:8]) || !bytes.Equal(onDisc[56:], loader[56:2048]) {
+		t.Fatal("legacy boot image content differs outside the BootInfoTable region")
+	}
+	if got := binary.LittleEndian.Uint32(onDisc[8:12]); got != 16 {
+		t.Fatalf("bi_pvd = %d, want 16", got)
+	}
+	if got := binary.LittleEndian.Uint32(onDisc[12:16]); got != bootLba {
+		t.Fatalf("bi_file = %d, want %d", got, bootLba)
+	}
+	if got := binary.LittleEndian.Uint32(onDisc[16:20]); got != uint32(len(loader)) {
+		t.Fatalf("bi_length = %d, want %d", got, len(loader))
+	}
+	var want uint32
+	for i := 64; i < sector; i += 4 {
+		want += binary.LittleEndian.Uint32(loader[i:])
+	}
+	if got := binary.LittleEndian.Uint32(onDisc[20:24]); got != want {
+		t.Fatalf("bi_csum = %#x, want %#x", got, want)
+	}
+	for i := 24; i < 56; i++ {
+		if onDisc[i] != 0 {
+			t.Fatalf("reserved BootInfoTable byte %d = %#x, want 0", i, onDisc[i])
+		}
+	}
+	// And the UDF copy carries the same patched bytes (shared extent).
+	if got := v.readFile(fe); !bytes.Equal(got[:2048], onDisc) {
+		t.Fatal("UDF copy of the legacy boot image lacks the BootInfoTable")
+	}
+}
+
+// TestDispersedUdfBridgeBothBootImages: with --boot-image (EFI) and
+// --legacy-boot-image (x86 BIOS), the catalog's BIOS entry comes first.
+func TestDispersedUdfBridgeBothBootImages(t *testing.T) {
+	xorriso, err := exec.LookPath("xorriso")
+	if err != nil {
+		t.Skip("xorriso not installed")
+	}
+	dir := t.TempDir()
+	pngPath := writeGradientPng(t, filepath.Join(dir, "gradient.png"), 64)
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "boot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "boot", "loader.bin"), bytes.Repeat([]byte{0x5A}, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "efi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "efi", "efi.bin"), bytes.Repeat([]byte{0x77}, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	isoPath := filepath.Join(dir, "disc.iso")
+	code := RunCommand([]string{
+		"solve", "--image", pngPath, "--iso-output", isoPath,
+		"--total-sectors", "4096", "--data-dir", dataDir,
+		"--filesystem", "udf-bridge",
+		"--boot-image", "efi/efi.bin", "--legacy-boot-image", "boot/loader.bin",
+	})
+	if code != 0 {
+		t.Fatalf("solve exited %d", code)
+	}
+	output, err := exec.Command(xorriso, "-indev", isoPath, "-report_el_torito", "plain").CombinedOutput()
+	if err != nil {
+		t.Fatalf("xorriso: %v\n%s", err, output)
+	}
+	text := string(output)
+	t.Logf("xorriso -report_el_torito plain:\n%s", text)
+	biosAt := strings.Index(text, "BIOS")
+	uefiAt := strings.Index(text, "UEFI")
+	if biosAt < 0 || uefiAt < 0 {
+		t.Fatalf("xorriso did not report both a BIOS and a UEFI entry:\n%s", text)
+	}
+	if biosAt > uefiAt {
+		t.Fatalf("the BIOS (legacy) entry must appear before the UEFI one:\n%s", text)
+	}
+}
