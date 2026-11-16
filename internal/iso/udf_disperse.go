@@ -17,9 +17,10 @@ import (
 	"strings"
 )
 
-// udfMaxAllocationDescriptors is the short_ad capacity of one 2048-byte UDF
-// file entry with no extended attributes: (2048-176)/8 = 234.
-const udfMaxAllocationDescriptors = (LogicalSectorBytes - 176) / 8
+// UdfMaxAllocationDescriptors is the short_ad capacity of one 2048-byte UDF
+// file entry with no extended attributes: (2048-176)/8 = 234. The dispersed
+// DVD planner uses it to keep every file under the one-file-entry limit.
+const UdfMaxAllocationDescriptors = (LogicalSectorBytes - 176) / 8
 
 // UdfExtraFile is a synthetic file not present on disk (e.g. a boot image or
 // boot catalog). Name is the root-level file name (UDF CS0 identifier rules).
@@ -176,8 +177,8 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 				node.dataLength += int64(udfFileIdentifierLength(len(child.identifier), node.dataLength))
 			}
 		}
-		if (node.dataLength+udfMaximumExtentBytes-1)/udfMaximumExtentBytes >
-			udfMaxAllocationDescriptors {
+		if (node.dataLength+UdfMaximumExtentBytes-1)/UdfMaximumExtentBytes >
+			UdfMaxAllocationDescriptors {
 			return nil, fmt.Errorf("File needs more allocation descriptors than one UDF file entry supports: %s", udfDispersedFileLabel(node))
 		}
 		childDirectories := 0
@@ -348,7 +349,7 @@ func (p *UdfDispersedPlan) AssignExtents(extents map[int][]UdfFileExtent) error 
 	for index, node := range p.files {
 		label := udfDispersedFileLabel(node)
 		list := extents[index]
-		if len(list) > udfMaxAllocationDescriptors {
+		if len(list) > UdfMaxAllocationDescriptors {
 			return fmt.Errorf("File needs more allocation descriptors than one UDF file entry supports: %s", label)
 		}
 		descriptors := 0
@@ -385,7 +386,7 @@ func (p *UdfDispersedPlan) AssignExtents(extents map[int][]UdfFileExtent) error 
 			} else {
 				offset += cover
 			}
-			descriptors += int((cover + udfMaximumExtentBytes - 1) / udfMaximumExtentBytes)
+			descriptors += int((cover + UdfMaximumExtentBytes - 1) / UdfMaximumExtentBytes)
 			all = append(all, placedExtent{start, end})
 			if end > partitionEnd {
 				partitionEnd = end
@@ -394,7 +395,7 @@ func (p *UdfDispersedPlan) AssignExtents(extents map[int][]UdfFileExtent) error 
 		if offset != node.dataLength {
 			return fmt.Errorf("UDF extents cover %d of %d bytes of the file: %s", offset, node.dataLength, label)
 		}
-		if descriptors > udfMaxAllocationDescriptors {
+		if descriptors > UdfMaxAllocationDescriptors {
 			return fmt.Errorf("File needs more allocation descriptors than one UDF file entry supports: %s", label)
 		}
 		perFile[index] = append([]UdfFileExtent(nil), list...)
@@ -545,7 +546,7 @@ func udfDispersedRenderDirectoryData(plan *UdfLayoutPlan, rendered map[uint32][]
 // extent list instead of the single contiguous run starting at node.dataLba.
 // Each caller extent emits one short_ad (8 bytes: length with high-2-bits
 // extent type 0, position = LBN = Lba - partitionStart), in extent order;
-// over-long extents split at udfMaximumExtentBytes exactly like udfFileEntry.
+// over-long extents split at UdfMaximumExtentBytes exactly like udfFileEntry.
 // dataLength and the blocks-recorded field (U64 at offset 64) stay the file's
 // full size/sector count. Empty files emit no allocation descriptors, exactly
 // like udfFileEntry.
@@ -599,8 +600,8 @@ func udfDispersedFileEntry(plan *UdfLayoutPlan, node *udfNode, extents []UdfFile
 		lbn := extent.Lba - plan.partitionStartLba
 		for length > 0 {
 			chunk := length
-			if chunk > udfMaximumExtentBytes {
-				chunk = udfMaximumExtentBytes
+			if chunk > UdfMaximumExtentBytes {
+				chunk = UdfMaximumExtentBytes
 			}
 			udfU32(data, offset, uint32(chunk))
 			udfU32(data, offset+4, lbn)

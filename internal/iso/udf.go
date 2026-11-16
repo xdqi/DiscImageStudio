@@ -17,11 +17,13 @@ import (
 )
 
 const (
-	udfMainVdsLba         = 32
-	udfVdsSectors         = 16
-	udfIntegrityLba       = 48
-	udfFirstPartitionLba  = 288
-	udfMaximumExtentBytes = 0x3ffff800
+	udfMainVdsLba        = 32
+	udfVdsSectors        = 16
+	udfIntegrityLba      = 48
+	udfFirstPartitionLba = 288
+	// UdfMaximumExtentBytes is the largest byte length one short_ad covers
+	// (the top 2 bits of the length word are the extent type).
+	UdfMaximumExtentBytes = 0x3ffff800
 	udfImplementationId   = "*DiscImageStudio"
 
 	udfCopyBufferBytes = 128 * 1024
@@ -143,7 +145,7 @@ func planUdf(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 		}
 		// A single-layer Blu-ray needs at most 24 descriptors. Fail explicitly if this
 		// generic writer is ever used beyond one FE's capacity instead of truncating it.
-		if (node.dataLength+udfMaximumExtentBytes-1)/udfMaximumExtentBytes >
+		if (node.dataLength+UdfMaximumExtentBytes-1)/UdfMaximumExtentBytes >
 			(LogicalSectorBytes-176)/8 {
 			return nil, fmt.Errorf("File needs more allocation descriptors than one UDF file entry supports: %s", node.sourcePath)
 		}
@@ -593,8 +595,8 @@ func udfFileEntry(plan *UdfLayoutPlan, node *udfNode) []byte {
 	lbn := node.dataLba - plan.partitionStartLba
 	for remaining > 0 {
 		length := remaining
-		if length > udfMaximumExtentBytes {
-			length = udfMaximumExtentBytes
+		if length > UdfMaximumExtentBytes {
+			length = UdfMaximumExtentBytes
 		}
 		udfU32(data, offset, uint32(length))
 		udfU32(data, offset+4, lbn)
