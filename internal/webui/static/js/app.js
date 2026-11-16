@@ -397,7 +397,9 @@ function runBoundaryFit() {
     state.fitResult = result;
     state.selectedCandidate = 0;
     showFitResult(result, target, 2);
-    $("apply-fit").disabled = !result.succeeded;
+    // A verification failure still carries the candidates the solver found:
+    // let the user review the predicted curve and apply anyway.
+    $("apply-fit").disabled = result.candidates.length === 0;
   }, 30);
 }
 
@@ -447,11 +449,16 @@ function runFineFit() {
 // -- fit result display & prediction overlay --
 
 function showFitResult(result, target, armCount) {
-  if (!result.succeeded || !result.bestParameters) {
+  const verified = result.succeeded && result.bestParameters;
+  if (!verified && result.candidates.length === 0) {
+    // Hard failure: the solver found nothing — show only the reason.
     $("fit-result").innerHTML = `<p class="warn">${result.warnings.map(escapeHtml).join("<br>")}</p>`;
     drawPrediction(target, null, 0);
     return;
   }
+  // Verification failures still carry candidates: present them as a warning
+  // with the full result and the predicted curve, so the user can judge the
+  // fit against the photo.
   let html = `<p>RMS ${result.rmsErrorMm.toFixed(4)} mm · rotation ${(result.rotationRadians * 180 / Math.PI).toFixed(3)}°</p>`;
   html += `<table><tr><th>#</th><th>Inner</th><th>Outer</th><th>pitch c1</th><th>c2</th><th>c3</th><th>RMS</th><th>Max</th></tr>`;
   result.candidates.forEach((c, i) => {
@@ -475,9 +482,14 @@ function showFitResult(result, target, armCount) {
     });
   }
   drawPrediction(target, result.candidates[state.selectedCandidate], armCount);
-  setStatus($("measure-status"), result.warnings.length === 0
-    ? "Fit succeeded. Check the predicted curve against the photo, then apply."
-    : "Fit produced warnings; review them before applying.", result.warnings.length === 0 ? "ok" : "warning");
+  if (!verified) {
+    setStatus($("measure-status"),
+      "Automatic verification did not pass — showing the best fit anyway. Check the predicted curve against the photo before applying.", "warning");
+  } else {
+    setStatus($("measure-status"), result.warnings.length === 0
+      ? "Fit succeeded. Check the predicted curve against the photo, then apply."
+      : "Fit produced warnings; review them before applying.", result.warnings.length === 0 ? "ok" : "warning");
+  }
 }
 
 function drawPrediction(target, candidate, armCount) {
@@ -510,7 +522,7 @@ function escapeHtml(text) {
 
 function applyFit() {
   const result = state.fitResult;
-  if (!result || !result.succeeded) return;
+  if (!result || result.candidates.length === 0) return;
   const candidate = result.candidates[state.selectedCandidate] ?? result.candidates[0];
   const p = { ...readParams(), ...candidate.parameters };
   writeParams(p);

@@ -103,6 +103,41 @@ test("boundary fitter recovers actual radii from synthesized segments", () => {
   assert.ok(Math.abs(fit.bestParameters.outerRadiusMm - 58.008) < 5e-4, `outer ${fit.bestParameters.outerRadiusMm}`);
 });
 
+test("boundary fitter keeps candidates when verification fails", () => {
+  // The UI relies on this contract: an unverified fit still carries the
+  // candidate list (plus finite RMS/rotation) so it can show the result and
+  // the predicted curve as a warning instead of an error.
+  const target = new Target(dvdParams, STAGE_BOUNDARY);
+  const actual = { ...dvdParams, innerRadiusMm: 23.992, outerRadiusMm: 58.008 };
+  const rotation = 0.3;
+  const model = new CalibrationCrossModel(
+    new CalibrationGeometry(dvdParams), new CalibrationGeometry(actual), DISC_DVD, false, target);
+  const segments = [];
+  let id = 0;
+  for (const [q0, q1] of [[24.3, 33], [40, 49], [52, 57.5]]) {
+    const points = [];
+    for (let r = q0; r <= q1; r += 0.35) {
+      const s = model.tryAtRadius(r);
+      const angle = -Math.PI / 2 + s.phase + rotation;
+      points.push({ x: r * Math.cos(angle), y: r * Math.sin(angle) });
+    }
+    segments.push({ id: id++, points });
+  }
+  // Shift the search box so the true solution sits on its edge: that forces
+  // the "search boundary" verification warning.
+  const searchCenter = { ...dvdParams, innerRadiusMm: 23.992 + 0.01 - 1e-5, outerRadiusMm: 58.008 };
+  const fit = fitBoundary(target, segments, { radiusRangeMm: 0.01, searchCenter });
+  assert.ok(!fit.succeeded, "verification should fail (best candidate on the search boundary)");
+  assert.ok(fit.warnings.length > 0, "warnings explain the failure");
+  assert.ok(fit.candidates.length > 0, "candidates must be populated for the UI");
+  assert.ok(Number.isFinite(fit.rmsErrorMm) && Number.isFinite(fit.rotationRadians),
+    "RMS and rotation must be finite for the result header");
+  assert.ok(Math.abs(fit.candidates[0].parameters.innerRadiusMm - 23.992) < 5e-4,
+    `candidate inner ${fit.candidates[0].parameters.innerRadiusMm}`);
+  assert.ok(Math.abs(fit.candidates[0].parameters.outerRadiusMm - 58.008) < 5e-4,
+    `candidate outer ${fit.candidates[0].parameters.outerRadiusMm}`);
+});
+
 test("cross fitter recovers radii and rotation from a synthesized arm", () => {
   const target = new Target(dvdParams, STAGE_FINE);
   const actual = { ...dvdParams, innerRadiusMm: 24.011, outerRadiusMm: 57.979 };
