@@ -118,20 +118,10 @@ let photoCanvas = null;
 let rectCanvas = null;
 let photoClickMode = "outer";
 
-async function importPhoto(file) {
-  try {
-    state.photo = await Photo.load(file);
-  } catch (error) {
-    setStatus($("rectify-status"), `Could not read the photo: ${error.message ?? error}`, "error");
-    return;
-  }
-  state.transform = null;
-  state.rectified = null;
-  state.outerPoints = [];
-  state.holePoints = [];
-  $("measure-panel").classList.add("hidden");
-  if (photoCanvas) photoCanvas.canvas.remove();
-  photoCanvas = new ImageCanvas($("photo-canvas"), state.photo.canvas);
+// Binds the photo canvas to the current edge-point arrays. The point sets
+// hold live references to state.outerPoints / state.holePoints, so those
+// arrays must always be mutated in place (never reassigned) afterwards.
+function wirePhotoCanvas() {
   photoCanvas.pointSets = [
     { points: state.outerPoints, color: "#4da3ff", world: false },
     { points: state.holePoints, color: "#ffa54d", world: false },
@@ -149,6 +139,23 @@ async function importPhoto(file) {
     set.points.splice(index, 1);
     photoCanvas.redraw();
   };
+}
+
+async function importPhoto(file) {
+  try {
+    state.photo = await Photo.load(file);
+  } catch (error) {
+    setStatus($("rectify-status"), `Could not read the photo: ${error.message ?? error}`, "error");
+    return;
+  }
+  state.transform = null;
+  state.rectified = null;
+  state.outerPoints = [];
+  state.holePoints = [];
+  $("measure-panel").classList.add("hidden");
+  if (!photoCanvas) photoCanvas = new ImageCanvas($("photo-canvas"), state.photo.canvas);
+  else photoCanvas.setImage(state.photo.canvas, false);
+  wirePhotoCanvas();
   photoCanvas.fit();
   setStatus($("rectify-status"),
     `Photo loaded (${state.photo.width}×${state.photo.height}). Mark the physical outer edge and the centre-hole edge, then compute the rectification.`, "");
@@ -171,12 +178,14 @@ function computeRectification() {
 function renderRectifiedView(size) {
   const rectified = renderRectified(state.photo, state.transform, state.physicalOuterRadiusMm, size);
   state.rectified = rectified;
-  if (rectCanvas) rectCanvas.canvas.remove();
-  rectCanvas = new ImageCanvas($("rectified-canvas"), rectified.canvas);
+  // Unhide before touching the canvas layout: fitting a canvas inside a
+  // display:none panel measures a zero size and renders a one-pixel speck.
+  $("measure-panel").classList.remove("hidden");
+  if (!rectCanvas) rectCanvas = new ImageCanvas($("rectified-canvas"), rectified.canvas);
+  else rectCanvas.setImage(rectified.canvas, false);
   rectCanvas.setWorldTransform(-rectified.canvasRadiusMm, -rectified.canvasRadiusMm,
     rectified.canvasRadiusMm, rectified.canvasRadiusMm);
   rectCanvas.fit();
-  $("measure-panel").classList.remove("hidden");
   setupMeasurement();
   $("measure-panel").scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -563,12 +572,9 @@ async function loadSession(file) {
   state.rectified = null;
   if (session.photoPng) {
     state.photo = await Photo.fromDataUrl(session.photoPng);
-    if (photoCanvas) photoCanvas.canvas.remove();
-    photoCanvas = new ImageCanvas($("photo-canvas"), state.photo.canvas);
-    photoCanvas.pointSets = [
-      { points: state.outerPoints, color: "#4da3ff", world: false },
-      { points: state.holePoints, color: "#ffa54d", world: false },
-    ];
+    if (!photoCanvas) photoCanvas = new ImageCanvas($("photo-canvas"), state.photo.canvas);
+    else photoCanvas.setImage(state.photo.canvas, false);
+    wirePhotoCanvas();
     photoCanvas.fit();
     if (session.transform9) {
       try {
@@ -618,9 +624,12 @@ function main() {
     $("mode-outer").classList.remove("active");
   });
   $("clear-points").addEventListener("click", () => {
-    state.outerPoints = [];
-    state.holePoints = [];
+    // Clear in place: the canvas point sets reference these exact arrays, so
+    // reassigning them here would leave the old points on screen.
+    state.outerPoints.length = 0;
+    state.holePoints.length = 0;
     if (photoCanvas) photoCanvas.redraw();
+    setStatus($("rectify-status"), "Edge points cleared.", "");
   });
   $("rectify").addEventListener("click", computeRectification);
   $("apply-fit").addEventListener("click", applyFit);
