@@ -21,6 +21,10 @@ func solveMultipleBlocks(arguments *cliArguments, fillSectors uint32) error {
 	if err != nil {
 		return err
 	}
+	// The dispersed UDF modes have their own pipeline.
+	if fs := strings.ToLower(arguments.Get("filesystem", "")); fs == "udf" || fs == "udf-bridge" || arguments.Has("boot-image") {
+		return solveDispersedUdf(arguments)
+	}
 	unsupported := []string{
 		"output",
 		"iso-template",

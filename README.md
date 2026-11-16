@@ -9,6 +9,32 @@ same 12 commands with byte-identical output files:
 | CD | `cd-generate`, `cd-preview-warp`, `cd-preview-track` |
 | DVD data disc | `solve`, `encode`, `calibrate`, `simulate`, `selftest` |
 | Blu-ray BD-R | `bd-info`, `bd-probe`, `bd-encode`, `bd-generate` |
+| Calibration | `calibration-target`, `calibrate-ui` |
+
+## Dispersed hybrid discs (DVD)
+
+`solve --data-dir DIR --filesystem udf` embeds a UDF 2.01 filesystem whose file
+data is *dispersed into the picture*: the 3-tone conversion renders the source
+image as black/white/gray, where gray sectors are real data. Mid-tone areas and
+the interiors of large flat areas host the data (scrambled sectors read as
+mid-gray to the eye), so the files are invisible in the burned picture.
+
+```sh
+./disc-image-studio solve --image pic.png --iso-output disc.iso \
+  --total-sectors 2297888 --data-dir ./files --filesystem udf
+```
+
+`--filesystem udf-bridge --boot-image boot.bin` adds a minimal ISO9660 layer
+with an El Torito boot catalog (BIOS, no-emulation) containing only the boot
+files; everything else lives in UDF. The boot image is one continuous extent
+(position assigned from the picture's gray area); both filesystems share it.
+
+Knobs: `--gray-band T1:T2` (manual luminance band; default widens from
+120:136 until capacity fits), `--interior-margin`/`--interior-margin-black`
+(border width kept at the original color on flat areas), `--data-headroom`
+(gray capacity target, default 1.10× the data). The `<iso>.json` sidecar
+records the resolved constraint list (`{"role","length","fixedAt"}`) and the
+per-file fragment placements.
 
 Every command supports `--help` (alias `-h`), e.g. `disc-image-studio
 cd-generate --help`, which prints the command's options with types, defaults,
@@ -67,7 +93,10 @@ identifiers).
 - `internal/core` — module contracts, option parsing, tone profile/dither, grayscale palettes
 - `internal/trackgeom` — the cubic-pitch spiral geometry (`DvdTrackGeometry` port)
 - `internal/raster` — image loading (PNG/JPEG/GIF/BMP) to BGRA32 and PNG writing
-- `internal/iso` — ISO9660/Joliet and UDF 2.01 image writers
+- `internal/iso` — ISO9660/Joliet and UDF 2.01 image writers, the
+  dispersed-extent UDF variant, and the ISO9660 + El Torito bridge layer
+- `internal/dvd` — DVD engine plus the dispersed 3-tone hybrid pipeline
+  (tone map, constraint planner, interleaved writer)
 - `internal/cd` — CD audio/data engine (CIRC interleave, WAV/CUE, Mode 1 ISO, previews)
 - `internal/dvd` — DVD engine (EFM+, Reed–Solomon ECC, dispersion solver, previews, self-tests)
 - `internal/dvdmodule` — the DVD CLI module adapter (fixed fast-dispersion options)
