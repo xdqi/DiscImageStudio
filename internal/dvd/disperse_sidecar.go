@@ -68,7 +68,7 @@ func writeDisperseSidecar(isoPath string, plan *dispersePlan, udfPlan *iso.UdfDi
 		if len(extents) == 0 {
 			continue
 		}
-		placement := sidecarFilePlacement{Path: udfPlan.FileName(i)}
+		placement := sidecarFilePlacement{Path: udfPlan.FilePath(i)}
 		for _, e := range extents {
 			placement.Fragments = append(placement.Fragments, sidecarExtent{Lba: e.lba, Length: e.sectors, Offset: e.offset})
 		}

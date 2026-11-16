@@ -397,6 +397,20 @@ func (p *UdfDispersedPlan) WalkExposure(path string) (files []ExposureFile, dirs
 	return files, dirs, true
 }
 
+// FilePath returns the image-root-relative path of file index (e.g.
+// "pool/main/a/aaa.deb"); FileName returns only the basename, which is not
+// unique across the tree.
+func (p *UdfDispersedPlan) FilePath(index int) string {
+	var parts []string
+	for cur := p.files[index]; cur != nil && cur.parent != nil; cur = cur.parent {
+		parts = append(parts, cur.name)
+	}
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return strings.Join(parts, "/")
+}
+
 // FileSourcePath returns the source path of file index, "" for extras and
 // symlinks (their content comes from FileContent instead).
 func (p *UdfDispersedPlan) FileSourcePath(index int) string {
