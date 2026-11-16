@@ -84,30 +84,24 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		return err
 	}
 
-	// UDF plan (with the boot image as a UDF-visible extra in bridge mode).
-	var extraFiles []iso.UdfExtraFile
-	var bootImageBytes []byte
-	if bridge {
-		bootImageBytes, err = os.ReadFile(bootImagePath)
-		if err != nil {
-			return err
-		}
-		if len(bootImageBytes) == 0 {
-			return newArgumentError("The boot image is empty.")
-		}
-		extraFiles = append(extraFiles, iso.UdfExtraFile{
-			Name: filepath.Base(bootImagePath),
-			Size: int64(len(bootImageBytes)),
-			Fill: func() ([]byte, error) { return bootImageBytes, nil },
-		})
-	}
+	// The boot image (bridge mode) is a file inside the data directory, named
+	// by its image-root-relative path; it is placed contiguously and shared
+	// between the El Torito catalog and its UDF file entry — no extra copy.
 	vrsStart := uint32(16)
 	if bridge {
 		vrsStart = 19
 	}
-	udfPlan, err := iso.PrepareUdfDispersed(dataDir, imageMapping.TotalSectors, volumeLabel, vrsStart, extraFiles)
+	udfPlan, err := iso.PrepareUdfDispersed(dataDir, imageMapping.TotalSectors, volumeLabel, vrsStart, nil)
 	if err != nil {
 		return err
+	}
+	bootImageIndex := -1
+	if bridge {
+		index, found := udfPlan.FindFile(bootImagePath)
+		if !found {
+			return newArgumentError(fmt.Sprintf("--boot-image must name a regular file inside the data directory (path relative to the image root): %s", bootImagePath))
+		}
+		bootImageIndex = index
 	}
 
 	// Fixed constraints: the filesystem metadata that cannot move. The whole
@@ -137,12 +131,14 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		)
 	}
 
-	// Planner: continuous boot image run + aggregate file data.
+	// Planner: the boot image is a continuous demand linked to its tree file;
+	// everything else is aggregate file data.
 	var continuous []continuousDemand
 	if bridge {
-		bootSectors := uint32((int64(len(bootImageBytes)) + 2047) / 2048)
+		bootSectors := uint32((udfPlan.FileSize(bootImageIndex) + 2047) / 2048)
 		continuous = append(continuous, continuousDemand{
-			Role: "boot-image", Path: filepath.Base(bootImagePath), Sectors: bootSectors,
+			Role: "boot-image", Path: filepath.ToSlash(bootImagePath), Sectors: bootSectors,
+			FileIndex: bootImageIndex,
 		})
 	}
 	fileCount := udfPlan.FileCount()
@@ -187,7 +183,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	// The El Torito / ISO9660 layer (bridge only).
 	var bridgeLayer *iso.ElToritoBridge
 	if bridge {
-		bridgeLayer, err = iso.NewElToritoBridge(totalSectors, volumeLabel, filepath.Base(bootImagePath), int64(len(bootImageBytes)))
+		bridgeLayer, err = iso.NewElToritoBridge(totalSectors, volumeLabel, udfPlan.FileName(bootImageIndex), udfPlan.FileSize(bootImageIndex))
 		if err != nil {
 			return err
 		}

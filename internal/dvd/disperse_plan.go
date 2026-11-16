@@ -69,6 +69,10 @@ type continuousDemand struct {
 	Role    string
 	Path    string
 	Sectors uint32
+	// FileIndex >= 0 links the run to a file's content (the boot image):
+	// that file gets this single contiguous extent instead of being poured
+	// into fragments. -1 = pure metadata demand.
+	FileIndex int
 }
 
 // planDispersion computes the placement, widening the gray band and shrinking
@@ -100,13 +104,20 @@ func planDispersion(in dispersePlannerInputs) (*dispersePlan, error) {
 		}
 	}
 
-	fileSectorsTotal := uint64(0)
-	for _, size := range in.fileSizes {
-		fileSectorsTotal += uint64((size + 2047) / 2048)
-	}
 	continuousTotal := uint64(0)
+	continuousFile := map[int]bool{}
 	for _, d := range in.continuous {
 		continuousTotal += uint64(d.Sectors)
+		if d.FileIndex >= 0 {
+			continuousFile[d.FileIndex] = true
+		}
+	}
+	fileSectorsTotal := uint64(0)
+	for i, size := range in.fileSizes {
+		if continuousFile[i] {
+			continue // counted in continuousTotal: the extent is shared
+		}
+		fileSectorsTotal += uint64((size + 2047) / 2048)
 	}
 	needed := uint64(float64(fileSectorsTotal+continuousTotal) * in.headroom)
 
@@ -187,14 +198,25 @@ func placeDispersion(in dispersePlannerInputs, eligible []bool, fixedUsed []bool
 	used := make([]bool, in.totalSectors)
 	copy(used, fixedUsed)
 
-	// Continuous demands: first-fit into the eligible set, in LBA order.
+	// Continuous demands: first-fit into the eligible set, in LBA order. A
+	// file-linked demand (the boot image) is the file's single extent: the
+	// El Torito catalog and the UDF file entry share it.
 	for _, d := range in.continuous {
+		if d.FileIndex >= len(in.fileSizes) || d.FileIndex < -1 {
+			return nil, fmt.Errorf("continuous demand %s has an out-of-range file index %d", d.Role, d.FileIndex)
+		}
 		placedAt, found := findFreeRun(used, eligible, d.Sectors)
 		if !found {
 			return nil, &noContinuousRunError{msg: fmt.Sprintf("no continuous run of %d sectors remains for %s; the picture's gray areas are too scattered", d.Sectors, d.Role)}
 		}
 		markUsed(used, placedAt, d.Sectors)
 		plan.placed = append(plan.placed, placedExtent{Role: d.Role, Path: d.Path, Lba: placedAt, Sectors: d.Sectors})
+		if d.FileIndex >= 0 {
+			plan.fileExtents[d.FileIndex] = []fileExtent{{
+				lba: placedAt, offset: 0, sectors: d.Sectors,
+				fileIndex: d.FileIndex, filePath: in.filePaths[d.FileIndex],
+			}}
+		}
 	}
 
 	// File data: worst-fit decreasing. The unplaced files (and the unplaced
@@ -210,6 +232,9 @@ func placeDispersion(in dispersePlannerInputs, eligible []bool, fixedUsed []bool
 	}
 	files := &fileDemandHeap{}
 	for fileIndex, size := range in.fileSizes {
+		if len(plan.fileExtents[fileIndex]) > 0 {
+			continue // placed continuously above (the boot image)
+		}
 		if sectors := uint32((size + 2047) / 2048); sectors > 0 {
 			heap.Push(files, fileDemand{fileIndex: fileIndex, sectors: sectors})
 		}

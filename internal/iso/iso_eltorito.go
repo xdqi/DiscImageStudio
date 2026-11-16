@@ -25,7 +25,6 @@ const (
 
 	elToritoIdentifier = "EL TORITO SPECIFICATION"
 	bootCatalogIsoName = "BOOT.CAT;1"
-	bootCatalogUdfName = "boot.catalog"
 )
 
 // ElToritoBridge is the ISO9660 + El Torito layer of a UDF bridge disc.
@@ -105,27 +104,9 @@ func (b *ElToritoBridge) SectorContent(lba uint32) ([]byte, bool, error) {
 	return out, true, nil
 }
 
-// UdfExtraFiles exposes the boot image and boot catalog as UDF root files so
-// the UDF planner can include them. The boot image bytes are supplied by the
-// dvd writer (Fill unused); the catalog Fill returns the content built by
-// SetBootImageLba.
-func (b *ElToritoBridge) UdfExtraFiles() []UdfExtraFile {
-	return []UdfExtraFile{
-		{Name: b.bootImageName, Size: b.bootImageSize},
-		{
-			Name: bootCatalogUdfName,
-			Size: LogicalSectorBytes,
-			Fill: func() ([]byte, error) {
-				if !b.bootImageLbaSet {
-					return nil, errors.New("El Torito boot catalog is available only after SetBootImageLba.")
-				}
-				out := make([]byte, LogicalSectorBytes)
-				copy(out, b.sectors[bridgeBootCatalogLba])
-				return out, nil
-			},
-		},
-	}
-}
+// The boot image is not duplicated into the UDF tree as a synthetic extra:
+// --boot-image names an existing data-directory file, whose contiguous extent
+// is shared between the El Torito catalog and the file's UDF entry.
 
 func (b *ElToritoBridge) buildSectors() map[uint32][]byte {
 	return map[uint32][]byte{

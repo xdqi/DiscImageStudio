@@ -87,89 +87,255 @@ func TestDispersedUdfEndToEnd(t *testing.T) {
 	}
 }
 
-// readUdfFileByName is a minimal UDF reader for the test: walks the anchor →
-// main VDS → partition → FSD → root directory (recursing into subdirectories)
-// → file entry → extents.
-func readUdfFileByName(t *testing.T, data []byte, name string) []byte {
+// udfTestVolume is a minimal UDF reader for tests: walks the anchor → main
+// VDS → partition → FSD → root file entry, then reads entries/extents.
+type udfTestVolume struct {
+	t              *testing.T
+	data           []byte
+	partitionStart uint64
+	rootFe         []byte
+}
+
+func newUdfTestVolume(t *testing.T, data []byte) *udfTestVolume {
 	t.Helper()
 	const sector = 2048
 	// Anchor at 256: main VDS extent at offset 16 (length, lba).
 	anchor := data[256*sector:]
 	mainVdsLba := binary.LittleEndian.Uint32(anchor[20:24])
-	// Logical volume descriptor is the 4th descriptor in the main VDS (32+3).
+	// The partition descriptor is the 3rd descriptor in the main VDS; the
+	// partition starts at offset 188. The LVD (4th descriptor) holds the FSD
+	// long_ad at offset 248: length(4) at 248..252, lbn at 252..256.
 	lvd := data[(mainVdsLba+3)*sector:]
-	// Logical volume contents use: FSD at partition start is in the LVD's
-	// logical volume contents use long_ad at offset 248: (length, lbn). The
-	// partition map is at offset 264: ... partition reference at 268? Use the
-	// partition descriptor for the start: PD is at mainVdsLba+2, partition
-	// start at offset 188.
 	pd := data[(mainVdsLba+2)*sector:]
 	partitionStart := uint64(binary.LittleEndian.Uint32(pd[188:192]))
-	// LVD long_ad at offset 248: length(4) at 248..252, lbn at 252..256.
 	fsdLbn := binary.LittleEndian.Uint32(lvd[252:256])
 	fsd := data[(partitionStart+uint64(fsdLbn))*sector:]
 	// Root directory ICB: long_ad at offset 400: length at 400..404, lbn 404..408.
 	rootLbn := binary.LittleEndian.Uint32(fsd[404:408])
-	rootFe := data[(partitionStart+uint64(rootLbn))*sector:]
-	// Root FE: allocation descriptors at 176; short_ad list: (length, lbn).
-	readExtents := func(fe []byte) (uint64, []uint64) {
-		adLen := binary.LittleEndian.Uint32(fe[172:176])
-		infoLen := binary.LittleEndian.Uint64(fe[56:64])
-		var extents []uint64
-		for off := 176; off < 176+int(adLen); off += 8 {
-			length := binary.LittleEndian.Uint32(fe[off : off+4])
-			lbn := binary.LittleEndian.Uint32(fe[off+4 : off+8])
-			if length == 0 {
-				continue
-			}
-			extents = append(extents, uint64(lbn), uint64(length))
-		}
-		return infoLen, extents
+	return &udfTestVolume{
+		t:              t,
+		data:           data,
+		partitionStart: partitionStart,
+		rootFe:         data[(partitionStart+uint64(rootLbn))*sector:],
 	}
-	readFile := func(fe []byte) []byte {
-		infoLen, extents := readExtents(fe)
-		var out []byte
-		for i := 0; i+1 < len(extents); i += 2 {
-			lbn, length := extents[i], extents[i+1]
-			start := (partitionStart + lbn) * sector
-			out = append(out, data[start:start+length]...)
+}
+
+// extents parses a file entry's short_ad list into (lbn, length) pairs.
+func (v *udfTestVolume) extents(fe []byte) (uint64, []uint64) {
+	const sector = 2048
+	adLen := binary.LittleEndian.Uint32(fe[172:176])
+	infoLen := binary.LittleEndian.Uint64(fe[56:64])
+	var extents []uint64
+	for off := 176; off < 176+int(adLen); off += 8 {
+		length := binary.LittleEndian.Uint32(fe[off : off+4])
+		lbn := binary.LittleEndian.Uint32(fe[off+4 : off+8])
+		if length == 0 {
+			continue
 		}
-		return out[:infoLen]
+		extents = append(extents, uint64(lbn), uint64(length))
 	}
-	// Walk directories recursively: FIDs with file characteristics 10 = parent,
-	// 2 = directory, 0 = file.
+	return infoLen, extents
+}
+
+// readFile reads a file entry's content through its extents.
+func (v *udfTestVolume) readFile(fe []byte) []byte {
+	const sector = 2048
+	infoLen, extents := v.extents(fe)
+	var out []byte
+	for i := 0; i+1 < len(extents); i += 2 {
+		lbn, length := extents[i], extents[i+1]
+		start := (v.partitionStart + lbn) * sector
+		out = append(out, v.data[start:start+length]...)
+	}
+	return out[:infoLen]
+}
+
+// readDir parses a directory's file identifier records into name → child file
+// entry sector (the parent record excluded).
+func (v *udfTestVolume) readDir(fe []byte) map[string][]byte {
+	const sector = 2048
+	dirData := v.readFile(fe)
+	children := map[string][]byte{}
+	for off := 0; off+38 <= len(dirData); {
+		nameLen := int(dirData[off+19])
+		implLen := int(binary.LittleEndian.Uint16(dirData[off+36 : off+38]))
+		recLen := (38 + nameLen + 3) / 4 * 4
+		if recLen == 0 || off+recLen > len(dirData) {
+			break
+		}
+		characteristics := dirData[off+18]
+		if nameLen > 1 && characteristics&8 == 0 { // not the parent record
+			name := string(dirData[off+38+implLen+1 : off+38+implLen+nameLen])
+			icbLbn := binary.LittleEndian.Uint32(dirData[off+24 : off+28])
+			children[name] = v.data[(v.partitionStart+uint64(icbLbn))*sector:]
+		}
+		off += recLen
+	}
+	return children
+}
+
+// findFileEntry locates a file's entry sector by name, recursing into
+// subdirectories (directories have characteristic bit 2 set).
+func (v *udfTestVolume) findFileEntry(name string) []byte {
 	var walk func(fe []byte) []byte
 	walk = func(fe []byte) []byte {
-		dirData := readFile(fe)
-		for off := 0; off+38 <= len(dirData); {
-			nameLen := int(dirData[off+19])
-			implLen := int(binary.LittleEndian.Uint16(dirData[off+36 : off+38]))
-			recLen := (38 + nameLen + 3) / 4 * 4
-			if recLen == 0 || off+recLen > len(dirData) {
-				break
+		for childName, child := range v.readDir(fe) {
+			if strings.EqualFold(childName, name) {
+				return child
 			}
-			characteristics := dirData[off+18]
-			if nameLen > 1 {
-				fidName := string(dirData[off+38+implLen+1 : off+38+implLen+nameLen])
-				icbLbn := binary.LittleEndian.Uint32(dirData[off+24 : off+28])
-				child := data[(partitionStart+uint64(icbLbn))*sector:]
-				if characteristics&2 != 0 {
-					if found := walk(child); found != nil {
-						return found
-					}
-				} else if strings.EqualFold(fidName, name) {
-					return readFile(child)
+		}
+		for _, child := range v.readDir(fe) {
+			// Recurse into directories (their file entry has fileType 4 at 27).
+			if child[27] == 4 {
+				if found := walk(child); found != nil {
+					return found
 				}
 			}
-			off += recLen
 		}
 		return nil
 	}
-	if found := walk(rootFe); found != nil {
-		return found
+	return walk(v.rootFe)
+}
+
+// readUdfFileByName reads a file's content through the UDF structures.
+func readUdfFileByName(t *testing.T, data []byte, name string) []byte {
+	t.Helper()
+	v := newUdfTestVolume(t, data)
+	if fe := v.findFileEntry(name); fe != nil {
+		return v.readFile(fe)
 	}
 	t.Fatalf("file %q not found in UDF tree", name)
 	return nil
+}
+
+// TestDispersedUdfBridgeEndToEnd: --boot-image names a file inside the data
+// directory (image-root-relative path); it is placed contiguously and shared
+// between the El Torito catalog and its UDF file entry — with no copy at the
+// volume root.
+func TestDispersedUdfBridgeEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	pngPath := writeGradientPng(t, filepath.Join(dir, "gradient.png"), 64)
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "boot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loader := make([]byte, 4096)
+	for i := range loader {
+		loader[i] = byte(i*13 + 5)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "boot", "loader.bin"), loader, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hello := []byte("hello bridge\n")
+	if err := os.WriteFile(filepath.Join(dataDir, "hello.txt"), hello, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	isoPath := filepath.Join(dir, "disc.iso")
+	code := RunCommand([]string{
+		"solve", "--image", pngPath, "--iso-output", isoPath,
+		"--total-sectors", "4096", "--data-dir", dataDir,
+		"--filesystem", "udf-bridge", "--boot-image", "boot/loader.bin",
+	})
+	if code != 0 {
+		t.Fatalf("solve exited %d", code)
+	}
+	data, err := os.ReadFile(isoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sector = 2048
+
+	// El Torito boot catalog at sector 24: bootable no-emulation default entry.
+	catalog := data[24*sector:]
+	if catalog[32] != 0x88 {
+		t.Fatalf("catalog default entry boot indicator = %#x, want 0x88", catalog[32])
+	}
+	if got := binary.LittleEndian.Uint16(catalog[38:40]); got != uint16(len(loader)/512) {
+		t.Fatalf("catalog sector count = %d, want %d", got, len(loader)/512)
+	}
+	bootLba := binary.LittleEndian.Uint32(catalog[40:44])
+
+	// The UDF file entry of boot/loader.bin: exactly one extent, at the
+	// catalog's LBA, with the file's content.
+	v := newUdfTestVolume(t, data)
+	fe := v.findFileEntry("loader.bin")
+	if fe == nil {
+		t.Fatal("loader.bin not found in the UDF tree")
+	}
+	if got := binary.LittleEndian.Uint32(fe[172:176]); got != 8 {
+		t.Fatalf("boot image has %d allocation-descriptor bytes, want 8 (one extent)", got)
+	}
+	extentLength := binary.LittleEndian.Uint32(fe[176:180])
+	extentLbn := binary.LittleEndian.Uint32(fe[180:184])
+	if extentLength != uint32(len(loader)) {
+		t.Fatalf("boot image extent length = %d, want %d", extentLength, len(loader))
+	}
+	if v.partitionStart+uint64(extentLbn) != uint64(bootLba) {
+		t.Fatalf("UDF extent LBA %d != El Torito catalog LBA %d", v.partitionStart+uint64(extentLbn), bootLba)
+	}
+	if got := v.readFile(fe); !bytes.Equal(got, loader) {
+		t.Fatal("loader.bin content round-trip mismatch")
+	}
+
+	// No copy at the volume root: the root directory lists boot/ + hello.txt
+	// only.
+	rootNames := map[string]bool{}
+	for name := range v.readDir(v.rootFe) {
+		rootNames[name] = true
+	}
+	if rootNames["loader.bin"] {
+		t.Fatal("loader.bin must not be copied to the volume root")
+	}
+	if !rootNames["boot"] || !rootNames["hello.txt"] {
+		t.Fatalf("root names = %v, want boot + hello.txt", rootNames)
+	}
+
+	// The ISO9660 bridge's root record for the boot image points at the same
+	// LBA (shared extent).
+	rootDir := data[23*sector:]
+	found := false
+	for off := 0; off < sector; {
+		recLen := int(rootDir[off])
+		if recLen == 0 || off+recLen > sector {
+			break
+		}
+		nameLen := int(rootDir[off+32])
+		name := string(rootDir[off+33 : off+33+nameLen])
+		if name == "LOADER.BIN;1" {
+			found = true
+			if got := binary.LittleEndian.Uint32(rootDir[off+2 : off+6]); got != bootLba {
+				t.Fatalf("ISO9660 boot image record LBA = %d, want %d", got, bootLba)
+			}
+		}
+		off += recLen
+	}
+	if !found {
+		t.Fatal("ISO9660 root directory has no LOADER.BIN;1 record")
+	}
+}
+
+// TestDispersedUdfBridgeBootImageErrors: --boot-image must resolve inside the
+// data directory.
+func TestDispersedUdfBridgeBootImageErrors(t *testing.T) {
+	dir := t.TempDir()
+	pngPath := writeGradientPng(t, filepath.Join(dir, "gradient.png"), 64)
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "hello.txt"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, bootImage := range []string{"missing.bin", "sub/../hello.txt/.."} {
+		code := RunCommand([]string{
+			"solve", "--image", pngPath, "--iso-output", filepath.Join(dir, "out.iso"),
+			"--total-sectors", "4096", "--data-dir", dataDir,
+			"--filesystem", "udf-bridge", "--boot-image", bootImage,
+		})
+		if code == 0 {
+			t.Fatalf("solve --boot-image %q succeeded, want failure", bootImage)
+		}
+	}
 }
 
 func writeGradientPng(t *testing.T, path string, size int) string {

@@ -282,6 +282,47 @@ func (p *UdfDispersedPlan) FileSize(index int) int64 { return p.files[index].dat
 // FileName returns the UDF file name of file index.
 func (p *UdfDispersedPlan) FileName(index int) string { return p.files[index].name }
 
+// FindFile resolves a '/'-separated path relative to the volume root (the
+// data directory's root) to a file index for FileSize/FileName/.... Only
+// regular files resolve: directories, symlinks and missing names give
+// ok=false. Empty and "." components are ignored; matching is case-sensitive,
+// like the source tree.
+func (p *UdfDispersedPlan) FindFile(path string) (index int, ok bool) {
+	var components []string
+	for _, part := range strings.Split(path, "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		components = append(components, part)
+	}
+	if len(components) == 0 {
+		return 0, false
+	}
+	node := p.layout.nodes[0] // the root directory
+	for _, component := range components {
+		var next *udfNode
+		for _, child := range node.children {
+			if child.name == component {
+				next = child
+				break
+			}
+		}
+		if next == nil {
+			return 0, false
+		}
+		node = next
+	}
+	if node.isDirectory || node.isSymlink {
+		return 0, false
+	}
+	for index, file := range p.files {
+		if file == node {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
 // FileSourcePath returns the source path of file index, "" for extras and
 // symlinks (their content comes from FileContent instead).
 func (p *UdfDispersedPlan) FileSourcePath(index int) string {

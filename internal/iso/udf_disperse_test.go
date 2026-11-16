@@ -673,3 +673,57 @@ func udfDisperseTestWriteIsoBridge(t *testing.T, image []byte, volumeSectors uin
 	terminator[0], terminator[6] = 255, 1
 	copy(terminator[1:6], "CD001")
 }
+
+// TestUdfDispersedFindFile exercises image-root-relative path resolution for
+// the boot-image option: nested files resolve, directories, symlinks and
+// missing names do not.
+func TestUdfDispersedFindFile(t *testing.T) {
+	root := t.TempDir()
+	for name, content := range map[string]string{
+		"top.txt":           "top",
+		"sub/inner.txt":     "inner",
+		"sub/deep/deep.txt": "deep",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("top.txt", filepath.Join(root, "link.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	extras := []UdfExtraFile{{Name: "EXTRA.DAT", Size: 3, Fill: func() ([]byte, error) { return []byte("abc"), nil }}}
+	plan, err := PrepareUdfDispersed(root, 4096, "FIND", 16, extras)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexOf := func(name string) int {
+		for i := 0; i < plan.FileCount(); i++ {
+			if plan.FileName(i) == name {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, path := range []string{"top.txt", "/top.txt", "sub/inner.txt", "./sub//inner.txt", "sub/deep/deep.txt", "EXTRA.DAT"} {
+		index, ok := plan.FindFile(path)
+		if !ok {
+			t.Fatalf("FindFile(%q) = not found", path)
+		}
+		want := filepath.Base(path)
+		if plan.FileName(index) != want {
+			t.Fatalf("FindFile(%q) resolves to %q", path, plan.FileName(index))
+		}
+		if index != indexOf(want) {
+			t.Fatalf("FindFile(%q) index %d, want %d", path, index, indexOf(want))
+		}
+	}
+	for _, path := range []string{"", ".", "sub", "sub/deep", "missing.txt", "sub/missing.txt", "link.txt", "top.txt/extra"} {
+		if index, ok := plan.FindFile(path); ok {
+			t.Fatalf("FindFile(%q) = %d, want not found", path, index)
+		}
+	}
+}

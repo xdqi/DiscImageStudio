@@ -201,24 +201,6 @@ func TestElToritoBridgeAccessors(t *testing.T) {
 		t.Fatalf("accessors = %q/%d, want boot.img/4096", bridge.BootImageName(), bridge.BootImageSize())
 	}
 
-	extras := bridge.UdfExtraFiles()
-	if len(extras) != 2 {
-		t.Fatalf("UdfExtraFiles has %d entries, want 2", len(extras))
-	}
-	if extras[0].Name != "boot.img" || extras[0].Size != 4096 || extras[0].Fill != nil {
-		t.Fatalf("boot image extra = %+v", extras[0])
-	}
-	if extras[1].Name != "boot.catalog" || extras[1].Size != LogicalSectorBytes || extras[1].Fill == nil {
-		t.Fatalf("boot catalog extra = %+v", extras[1])
-	}
-	catalog, err := extras[1].Fill()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := mustBridgeSector(t, bridge, 24)
-	if string(catalog) != string(want) {
-		t.Fatal("catalog Fill content differs from sector 24")
-	}
 }
 
 func TestElToritoBridgeValidation(t *testing.T) {
