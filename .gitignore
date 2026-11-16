@@ -1,0 +1,11 @@
+# Built binaries
+/disc-image-studio
+/dvdtool
+
+# Go
+*.test
+*.out
+/dist/
+
+# OS/editor
+.DS_Store
