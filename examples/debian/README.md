@@ -9,7 +9,8 @@ boot catalog and the boot-critical files.
 ## Prerequisites
 
 - `disc-image-studio` (this repo; `go build -o disc-image-studio ./cmd/disc-image-studio`)
-- one of `xorriso`, `7z` or `bsdtar` (to unpack the installer ISO)
+- one of `xorriso` or `bsdtar` (to unpack the installer ISO; 7z is unsuitable —
+  its UDF parser rejects symlinks)
 - `ar` + `tar` (+ `xz`/`zstd`/`gzip` decompressors for the packages' payloads;
   `dpkg-deb` is used instead when available)
 - `cpio` (GNU or BusyBox), `bash`, `sed`, `find`
@@ -39,7 +40,7 @@ Options:
 
 ## What it does
 
-1. Unpacks the installer ISO (xorriso, else 7z, else bsdtar).
+1. Unpacks the installer ISO (xorriso, else bsdtar).
 2. Extracts `udf.mod` from the `grub-efi-amd64-bin` package into
    `boot/grub/x86_64-efi/` (GRUB needs it to read UDF).
 3. Extracts the `udf-modules` udeb into a temporary initrd overlay, moving

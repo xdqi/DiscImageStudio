@@ -98,17 +98,18 @@ WORK=$(mktemp -d /tmp/debian-iso.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 UNPACKED="$WORK/tree"
 
-# ---------- 1. Unpack the iso using xorriso/7z/bsdtar, whichever is available ----------
+# ---------- 1. Unpack the iso using xorriso or bsdtar, whichever is available ----------
+# (7z is deliberately not an option: its UDF parser rejects symlinks with
+# "Unsupported feature", which would break the round-trip check on the very
+# images this script produces.)
 echo "unpacking $INPUT_ISO ..."
 mkdir -p "$UNPACKED"
 if command -v xorriso >/dev/null 2>&1; then
 	xorriso -osirrox on -indev "$INPUT_ISO" -extract / "$UNPACKED" >/dev/null
-elif command -v 7z >/dev/null 2>&1; then
-	7z x -y -o"$UNPACKED" "$INPUT_ISO" >/dev/null
 elif command -v bsdtar >/dev/null 2>&1; then
 	bsdtar -xf "$INPUT_ISO" -C "$UNPACKED"
 else
-	die "need one of xorriso, 7z or bsdtar to unpack the ISO"
+	die "need one of xorriso or bsdtar to unpack the ISO"
 fi
 chmod -R u+w "$UNPACKED" # ISOs unpack read-only; we must append/edit files
 
