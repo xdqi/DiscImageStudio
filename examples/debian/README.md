@@ -6,6 +6,14 @@ into a UDF filesystem dispersed into the picture (invisible in the mid-tone
 and flat areas), with an ISO9660 + Joliet-long bridge carrying the El Torito
 boot catalog and the boot-critical files.
 
+## Preview
+
+![Burned Disc](assets/burned.jpeg)
+
+| Original Cover | Simulated Preview | Area Allocation |
+|----------------|------------------|-----------------|
+| ![Original Cover](cover.png) | ![Simulated Preview](assets/simmulate.png) | ![Area Allocation](assets/map.png)  (Cyan: Free Space; Magenta: Data) |
+
 ## Prerequisites
 
 - `disc-image-studio` (this repo; `go build -o disc-image-studio ./cmd/disc-image-studio`)
