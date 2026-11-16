@@ -58,12 +58,12 @@ func TestElToritoBridgeDescriptors(t *testing.T) {
 	if got := binary.LittleEndian.Uint32(pvd[132:136]); got != uint32(bridge.pathTableBytes) {
 		t.Fatalf("PVD path table size = %d, want %d", got, bridge.pathTableBytes)
 	}
-	if got := binary.LittleEndian.Uint32(pvd[140:144]); got != 22 {
-		t.Fatalf("PVD little-endian path table LBA = %d, want 22", got)
+	if got := binary.LittleEndian.Uint32(pvd[140:144]); got != bridgePathTableLba {
+		t.Fatalf("PVD path table LBA = %d, want %d", got, bridgePathTableLba)
 	}
 	// Root directory record embedded at offset 156 points at sector 23.
-	if got := binary.LittleEndian.Uint32(pvd[158:162]); got != 23 {
-		t.Fatalf("PVD root record LBA = %d, want 23", got)
+	if got := binary.LittleEndian.Uint32(pvd[158:162]); got != bridge.root.primaryDirectoryLba {
+		t.Fatalf("PVD root record LBA = %d", got)
 	}
 	if got := binary.LittleEndian.Uint32(pvd[166:170]); got != LogicalSectorBytes {
 		t.Fatalf("PVD root record extent length = %d, want %d", got, LogicalSectorBytes)
@@ -76,25 +76,25 @@ func TestElToritoBridgeDescriptors(t *testing.T) {
 	if got := string(bootRecord[7:39]); got != "EL TORITO SPECIFICATION         " {
 		t.Fatalf("boot record identifier = %q", got)
 	}
-	if got := binary.LittleEndian.Uint32(bootRecord[71:75]); got != 24 {
-		t.Fatalf("boot catalog LBA at offset 71 = %d, want 24", got)
+	if got := binary.LittleEndian.Uint32(bootRecord[71:75]); got != bridge.catalogLba {
+		t.Fatalf("boot catalog LBA at offset 71 = %d", got)
 	}
 
-	terminator := mustBridgeSector(t, bridge, 18)
+	terminator := mustBridgeSector(t, bridge, bridgeTerminatorLba)
 	if terminator[0] != 255 || string(terminator[1:6]) != "CD001" || terminator[6] != 1 {
 		t.Fatal("sector 18 is not a volume descriptor set terminator")
 	}
 
-	pathTable := mustBridgeSector(t, bridge, 22)
+	pathTable := mustBridgeSector(t, bridge, bridgePathTableLba)
 	if pathTable[0] != 1 || pathTable[1] != 0 ||
-		binary.LittleEndian.Uint32(pathTable[2:6]) != 23 ||
+		binary.LittleEndian.Uint32(pathTable[2:6]) != bridge.root.primaryDirectoryLba ||
 		binary.LittleEndian.Uint16(pathTable[6:8]) != 1 ||
 		pathTable[8] != 0 {
 		t.Fatalf("bad root-only path table: % x", pathTable[:10])
 	}
 
 	// Sectors owned by the UDF layer or the planner are not emitted.
-	for _, lba := range []uint32{15, 19, 20, 21, 25, 300, 4095} {
+	for _, lba := range []uint32{15, 20, 21, 22, 300, 4095} {
 		if _, ok, err := bridge.SectorContent(lba); err != nil || ok {
 			t.Fatalf("SectorContent(%d) = ok %v, err %v; want ok=false, err=nil", lba, ok, err)
 		}
@@ -103,7 +103,7 @@ func TestElToritoBridgeDescriptors(t *testing.T) {
 
 func TestElToritoBridgeCatalog(t *testing.T) {
 	bridge := newTestBridge(t)
-	catalog := mustBridgeSector(t, bridge, 24)
+	catalog := mustBridgeSector(t, bridge, bridge.catalogLba)
 
 	// Validation entry: 16 little-endian uint16 words must sum to zero.
 	var sum uint16
@@ -177,16 +177,16 @@ func parseDirRecords(t *testing.T, extent []byte) []parsedDirRecord {
 
 func TestElToritoBridgeRootDirectory(t *testing.T) {
 	bridge := newTestBridge(t)
-	extent := mustBridgeSector(t, bridge, 23)
+	extent := mustBridgeSector(t, bridge, bridge.root.primaryDirectoryLba)
 	records := parseDirRecords(t, extent)
 	if len(records) != 4 {
 		t.Fatalf("root directory has %d records, want 4", len(records))
 	}
 
 	want := []parsedDirRecord{
-		{lba: 23, size: LogicalSectorBytes, flags: 2, id: "\x00"},
-		{lba: 23, size: LogicalSectorBytes, flags: 2, id: "\x01"},
-		{lba: 24, size: LogicalSectorBytes, flags: 0, id: "BOOT.CAT;1"},
+		{lba: bridge.root.primaryDirectoryLba, size: LogicalSectorBytes, flags: 2, id: "\x00"},
+		{lba: bridge.root.primaryDirectoryLba, size: LogicalSectorBytes, flags: 2, id: "\x01"},
+		{lba: bridge.catalogLba, size: LogicalSectorBytes, flags: 0, id: "BOOT.CAT;1"},
 		{lba: 300, size: 4096, flags: 0, id: "BOOT.IMG;1"},
 	}
 	for i, w := range want {
@@ -245,8 +245,8 @@ func TestElToritoBridgeXorriso(t *testing.T) {
 	bridge := newTestBridge(t)
 	const volumeSectors = 4096
 	image := make([]byte, volumeSectors*LogicalSectorBytes)
-	for _, lba := range []uint32{16, 17, 18, 22, 23, 24} {
-		copy(image[int(lba)*LogicalSectorBytes:], mustBridgeSector(t, bridge, lba))
+	for _, extent := range bridge.MetadataExtents() {
+		copy(image[int(extent.Lba)*LogicalSectorBytes:], mustBridgeSector(t, bridge, extent.Lba))
 	}
 	path := filepath.Join(t.TempDir(), "bridge.iso")
 	if err := os.WriteFile(path, image, 0o644); err != nil {
@@ -259,8 +259,8 @@ func TestElToritoBridgeXorriso(t *testing.T) {
 	}
 	text := string(output)
 	t.Logf("xorriso -report_el_torito plain:\n%s", text)
-	if !strings.Contains(text, "El Torito catalog  : 24") {
-		t.Fatalf("xorriso did not report a boot catalog at sector 24:\n%s", text)
+	if !strings.Contains(text, fmt.Sprintf("El Torito catalog  : %d", bridge.catalogLba)) {
+		t.Fatalf("xorriso did not report the boot catalog:\n%s", text)
 	}
 	// The boot image line must report a BIOS no-emulation entry with the
 	// 4 KiB size (8 512-byte sectors) at the boot image LBA.
@@ -288,20 +288,17 @@ func TestElToritoBridgeExposedTree(t *testing.T) {
 	}
 	// Layout: path table @22 (3 entries × 10 bytes → 1 sector), then the
 	// directory extents in path-table order (root@23, A@24, B@25), catalog@26.
-	if bridge.catalogLba != 26 {
-		t.Fatalf("catalog LBA = %d, want 26", bridge.catalogLba)
-	}
 	if err := bridge.SetPlacements(300, []uint32{400, 500}); err != nil {
 		t.Fatal(err)
 	}
 
 	// Path table: (root, A, B) with parents (1, 1, 2) and extents (23, 24, 25).
-	pt := mustBridgeSector(t, bridge, 22)
+	pt := mustBridgeSector(t, bridge, bridgePathTableLba)
 	type ptEntry struct {
 		lba, parent uint32
 		id          byte
 	}
-	want := []ptEntry{{23, 1, 0}, {24, 1, 'A'}, {25, 2, 'B'}}
+	want := []ptEntry{{51, 1, 0}, {52, 1, 'A'}, {53, 2, 'B'}}
 	for i, w := range want {
 		off := i * 10
 		got := ptEntry{binary.LittleEndian.Uint32(pt[off+2:]), uint32(binary.LittleEndian.Uint16(pt[off+6:])), pt[off+8]}
@@ -310,13 +307,13 @@ func TestElToritoBridgeExposedTree(t *testing.T) {
 		}
 	}
 
-	root := parseDirRecords(t, mustBridgeSector(t, bridge, 23))
+	root := parseDirRecords(t, mustBridgeSector(t, bridge, 51))
 	wantRoot := []parsedDirRecord{
-		{lba: 23, size: LogicalSectorBytes, flags: 2, id: "\x00"},
-		{lba: 23, size: LogicalSectorBytes, flags: 2, id: "\x01"},
-		{lba: 26, size: LogicalSectorBytes, flags: 0, id: "BOOT.CAT;1"},
+		{lba: 51, size: LogicalSectorBytes, flags: 2, id: "\x00"},
+		{lba: 51, size: LogicalSectorBytes, flags: 2, id: "\x01"},
+		{lba: bridge.catalogLba, size: LogicalSectorBytes, flags: 0, id: "BOOT.CAT;1"},
 		{lba: 300, size: 4096, flags: 0, id: "BOOT.IMG;1"},
-		{lba: 24, size: LogicalSectorBytes, flags: 2, id: "A"},
+		{lba: 52, size: LogicalSectorBytes, flags: 2, id: "A"},
 	}
 	if len(root) != len(wantRoot) {
 		t.Fatalf("root records = %+v", root)
@@ -327,12 +324,12 @@ func TestElToritoBridgeExposedTree(t *testing.T) {
 		}
 	}
 
-	dirA := parseDirRecords(t, mustBridgeSector(t, bridge, 24))
+	dirA := parseDirRecords(t, mustBridgeSector(t, bridge, 52))
 	wantA := []parsedDirRecord{
-		{lba: 24, size: LogicalSectorBytes, flags: 2, id: "\x00"},
-		{lba: 23, size: LogicalSectorBytes, flags: 2, id: "\x01"},
+		{lba: 52, size: LogicalSectorBytes, flags: 2, id: "\x00"},
+		{lba: 51, size: LogicalSectorBytes, flags: 2, id: "\x01"},
 		{lba: 400, size: 100, flags: 0, id: "BAR;1"},
-		{lba: 25, size: LogicalSectorBytes, flags: 2, id: "B"},
+		{lba: 53, size: LogicalSectorBytes, flags: 2, id: "B"},
 	}
 	if len(dirA) != len(wantA) {
 		t.Fatalf("/A records = %+v", dirA)
@@ -343,10 +340,10 @@ func TestElToritoBridgeExposedTree(t *testing.T) {
 		}
 	}
 
-	dirB := parseDirRecords(t, mustBridgeSector(t, bridge, 25))
+	dirB := parseDirRecords(t, mustBridgeSector(t, bridge, 53))
 	wantB := []parsedDirRecord{
-		{lba: 25, size: LogicalSectorBytes, flags: 2, id: "\x00"},
-		{lba: 24, size: LogicalSectorBytes, flags: 2, id: "\x01"},
+		{lba: 53, size: LogicalSectorBytes, flags: 2, id: "\x00"},
+		{lba: 52, size: LogicalSectorBytes, flags: 2, id: "\x01"},
 		{lba: 500, size: 200, flags: 0, id: "BARZ;1"},
 	}
 	if len(dirB) != len(wantB) {
@@ -363,7 +360,7 @@ func TestElToritoBridgeExposedTree(t *testing.T) {
 	for _, extent := range bridge.MetadataExtents() {
 		lbas = append(lbas, extent.Lba)
 	}
-	wantLbas := []uint32{16, 17, 18, 22, 23, 24, 25, 26}
+	wantLbas := []uint32{16, 17, 18, 19, 54, 55, 56, 57, 50, 51, 52, 53, 58}
 	if len(lbas) != len(wantLbas) {
 		t.Fatalf("MetadataExtents LBAs = %v", lbas)
 	}
@@ -394,7 +391,7 @@ func TestElToritoBridgeExposedValidation(t *testing.T) {
 	if err := bridge.SetPlacements(300, []uint32{0}); err != nil {
 		t.Fatal(err)
 	}
-	records := parseDirRecords(t, mustBridgeSector(t, bridge, 23))
+	records := parseDirRecords(t, mustBridgeSector(t, bridge, bridge.root.primaryDirectoryLba))
 	last := records[len(records)-1]
 	if last.id != "EMPTY.BIN;1" || last.lba != 0 || last.size != 0 {
 		t.Fatalf("empty file record = %+v", last)

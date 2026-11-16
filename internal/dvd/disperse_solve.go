@@ -93,7 +93,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	// between the El Torito catalog and its UDF file entry — no extra copy.
 	vrsStart := uint32(16)
 	if bridge {
-		vrsStart = 19
+		vrsStart = 20
 	}
 	udfPlan, err := iso.PrepareUdfDispersed(dataDir, imageMapping.TotalSectors, volumeLabel, vrsStart, nil)
 	if err != nil {
@@ -136,7 +136,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	var bridgeLayer *iso.ElToritoBridge
 	if bridge {
 		bridgeLayer, err = iso.NewElToritoBridge(totalSectors, volumeLabel,
-			udfPlan.FileName(bootImageIndex), udfPlan.FileSize(bootImageIndex), exposed, extraDirs)
+			strings.ReplaceAll(bootImagePath, "\\", "/"), udfPlan.FileSize(bootImageIndex), exposed, extraDirs)
 		if err != nil {
 			return err
 		}
@@ -172,7 +172,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 			FileIndex: bootImageIndex,
 		})
 		for i := range exposed {
-			if exposed[i].Size == 0 {
+			if exposed[i].Size == 0 || exposedIndexes[i] == bootImageIndex {
 				continue // an empty file has no extent (ISO9660 record LBA 0)
 			}
 			continuous = append(continuous, continuousDemand{
@@ -233,6 +233,10 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		for i := range exposed {
 			if exposed[i].Size == 0 {
 				continue // empty file: no extent (ISO9660 record LBA 0)
+			}
+			if exposedIndexes[i] == bootImageIndex {
+				exposedLbas[i] = bootLba
+				continue
 			}
 			lba, ok := byRole["iso-expose/"+exposed[i].Path]
 			if !ok {

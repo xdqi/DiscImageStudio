@@ -24,10 +24,14 @@ mid-gray to the eye), so the files are invisible in the burned picture.
   --total-sectors 2297888 --data-dir ./files --filesystem udf
 ```
 
-`--filesystem udf-bridge --boot-image boot.bin` adds a minimal ISO9660 layer
-with an El Torito boot catalog (BIOS, no-emulation) containing only the boot
-files; everything else lives in UDF. The boot image is one continuous extent
-(position assigned from the picture's gray area); both filesystems share it.
+`--filesystem udf-bridge --boot-image boot/loader.bin` adds an ISO9660 and
+Joliet-long bridge with an El Torito boot catalog (BIOS, no-emulation). The
+boot path is relative to `--data-dir` and appears at the same path in both
+filesystems. Repeat `--expose PATH` to expose other files or directories
+recursively; their parent directories are included. Exposed files and the boot
+image occupy continuous extents shared with UDF. Joliet-long preserves names
+up to 103 UTF-16 code units; the primary ISO9660 view uses normalized names.
+Names that cannot be represented in Joliet are rejected rather than renamed.
 
 Knobs: `--gray-band T1:T2` (manual luminance band; default widens from
 120:136 until capacity fits), `--interior-margin`/`--interior-margin-black`

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -245,8 +246,9 @@ func TestDispersedUdfBridgeEndToEnd(t *testing.T) {
 	}
 	const sector = 2048
 
-	// El Torito boot catalog at sector 24: bootable no-emulation default entry.
-	catalog := data[24*sector:]
+	// The boot record points to the dynamically placed boot catalog.
+	catalogLba := binary.LittleEndian.Uint32(data[17*sector+71:])
+	catalog := data[int(catalogLba)*sector:]
 	if catalog[32] != 0x88 {
 		t.Fatalf("catalog default entry boot indicator = %#x, want 0x88", catalog[32])
 	}
@@ -290,27 +292,40 @@ func TestDispersedUdfBridgeEndToEnd(t *testing.T) {
 		t.Fatalf("root names = %v, want boot + hello.txt", rootNames)
 	}
 
-	// The ISO9660 bridge's root record for the boot image points at the same
-	// LBA (shared extent).
-	rootDir := data[23*sector:]
-	found := false
-	for off := 0; off < sector; {
-		recLen := int(rootDir[off])
-		if recLen == 0 || off+recLen > sector {
-			break
+	rootLba := binary.LittleEndian.Uint32(data[16*sector+158:])
+	rootSize := binary.LittleEndian.Uint32(data[16*sector+166:])
+	var bootDir iso9660TestRecord
+	for _, r := range parseIso9660DirRecords(t, data, rootLba, rootSize) {
+		if r.name == "LOADER.BIN;1" {
+			t.Fatal("boot image duplicated at ISO root")
 		}
-		nameLen := int(rootDir[off+32])
-		name := string(rootDir[off+33 : off+33+nameLen])
-		if name == "LOADER.BIN;1" {
+		if r.name == "BOOT" {
+			bootDir = r
+		}
+	}
+	if bootDir.lba == 0 {
+		t.Fatal("ISO9660 boot directory missing")
+	}
+	found := false
+	for _, r := range parseIso9660DirRecords(t, data, bootDir.lba, bootDir.size) {
+		if r.name == "LOADER.BIN;1" {
 			found = true
-			if got := binary.LittleEndian.Uint32(rootDir[off+2 : off+6]); got != bootLba {
-				t.Fatalf("ISO9660 boot image record LBA = %d, want %d", got, bootLba)
+			if r.lba != bootLba {
+				t.Fatalf("boot LBA %d != %d", r.lba, bootLba)
 			}
 		}
-		off += recLen
 	}
 	if !found {
-		t.Fatal("ISO9660 root directory has no LOADER.BIN;1 record")
+		t.Fatal("ISO9660 /BOOT/LOADER.BIN missing")
+	}
+	if sevenZip, err := exec.LookPath("7z"); err == nil {
+		cmd := exec.Command(sevenZip, "x", "-so", "-tudf", isoPath, "boot/loader.bin")
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		output, err := cmd.Output()
+		if err != nil || !bytes.Equal(output, loader) {
+			t.Fatalf("7z UDF extraction: %v, stderr %s", err, &stderr)
+		}
 	}
 }
 
@@ -352,11 +367,14 @@ func TestDispersedUdfBridgeExposeEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	pngPath := writeGradientPng(t, filepath.Join(dir, "gradient.png"), 64)
 	dataDir := filepath.Join(dir, "data")
+	longName := strings.Repeat("long-name-", 9) + ".txt"
 	for name, content := range map[string][]byte{
-		"boot/loader.bin": bytes.Repeat([]byte{0x5A}, 4096),
-		"a/foo":           []byte("not exposed\n"),
-		"a/bar":          []byte("exposed bar\n"),
-		"a/b/barz":        bytes.Repeat([]byte{0x42}, 3000),
+		"boot/loader.bin":   bytes.Repeat([]byte{0x5A}, 4096),
+		".disk/Info File":   []byte("joliet data"),
+		".disk/" + longName: []byte("long name"),
+		"a/foo":             []byte("not exposed\n"),
+		"a/bar":             []byte("exposed bar\n"),
+		"a/b/barz":          bytes.Repeat([]byte{0x42}, 3000),
 	} {
 		path := filepath.Join(dataDir, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -375,7 +393,7 @@ func TestDispersedUdfBridgeExposeEndToEnd(t *testing.T) {
 		"solve", "--image", pngPath, "--iso-output", isoPath,
 		"--total-sectors", "4096", "--data-dir", dataDir,
 		"--filesystem", "udf-bridge", "--boot-image", "boot/loader.bin",
-		"--expose", "a/bar", "--expose=a/b",
+		"--expose", "a/bar", "--expose=a/b", "--expose=.disk", "--expose=boot",
 	})
 	if code != 0 {
 		t.Fatalf("solve exited %d", code)
@@ -410,8 +428,29 @@ func TestDispersedUdfBridgeExposeEndToEnd(t *testing.T) {
 	if _, ok := byName["BOOT.CAT;1"]; !ok {
 		t.Fatalf("root lacks BOOT.CAT;1: %v", root)
 	}
-	if _, ok := byName["LOADER.BIN;1"]; !ok {
-		t.Fatalf("root lacks LOADER.BIN;1: %v", root)
+	if _, ok := byName["BOOT"]; !ok {
+		t.Fatalf("root lacks BOOT directory: %v", root)
+	}
+	if xorriso, err := exec.LookPath("xorriso"); err == nil {
+		for path, want := range map[string][]byte{
+			"/.disk/Info File":   []byte("joliet data"),
+			"/.disk/" + longName: []byte("long name"),
+			"/boot/loader.bin":   bytes.Repeat([]byte{0x5A}, 4096),
+		} {
+			dest := filepath.Join(t.TempDir(), "extracted")
+			output, err := exec.Command(xorriso, "-osirrox", "on", "-indev", isoPath, "-extract", path, dest).CombinedOutput()
+			if err != nil {
+				t.Fatalf("xorriso extract %s: %v\n%s", path, err, output)
+			}
+			got, err := os.ReadFile(dest)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("extract %s: content mismatch: %v", path, err)
+			}
+		}
+		output, err := exec.Command(xorriso, "-indev", isoPath, "-report_el_torito", "plain").CombinedOutput()
+		if err != nil || !bytes.Contains(output, []byte("El Torito boot img")) {
+			t.Fatalf("El Torito report: %v\n%s", err, output)
+		}
 	}
 	dirA, ok := byName["A"]
 	if !ok || dirA.flags&2 == 0 {

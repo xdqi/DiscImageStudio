@@ -1,7 +1,7 @@
 // iso_eltorito.go implements the ISO9660 + El Torito layer of a UDF bridge
 // disc: a minimal ISO9660 volume at the inner edge that carries an El Torito
 // boot catalog and, optionally, exposes selected data files (each stored
-// contiguously) at the same paths they have in the image. Sectors 19..21
+// contiguously) at the same paths they have in the image. Sectors 20..22
 // belong to the UDF volume recognition sequence and are not emitted by this
 // layer.
 package iso
@@ -12,16 +12,18 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// Fixed bridge layout (2048-byte sectors): descriptors at 16-18, the UDF
-// volume recognition sequence owns 19-21, and the ISO9660 tree (path table,
-// directory extents, boot catalog) starts at 22. It must end before the
-// anchor volume descriptor at 256.
+// Fixed bridge layout (2048-byte sectors): ISO descriptors at 16-19, UDF
+// volume recognition at 20-22, UDF descriptors at 32-49, and both ISO9660
+// and Joliet trees from 50 through the boot catalog, before the anchor at 256.
 const (
-	bridgeBootRecordLba uint32 = 17
-	bridgePathTableLba  uint32 = 22
-	bridgeAnchorLba     uint32 = 256
+	bridgeBootRecordLba    uint32 = 17
+	bridgeSupplementaryLba uint32 = 18
+	bridgeTerminatorLba    uint32 = 19
+	bridgePathTableLba     uint32 = 50 // 32..49 are UDF descriptors
+	bridgeAnchorLba        uint32 = 256
 
 	maxBootImageBytes = int64(2048) * 2048 * 2048
 
@@ -57,11 +59,14 @@ type ElToritoBridge struct {
 	exposed       []ExposedFile
 	exposedNodes  []*isoNode
 
-	root             *isoNode
-	directories      []*isoNode
-	pathTableBytes   int
-	pathTableSectors uint32
-	catalogLba       uint32
+	root                   *isoNode
+	directories            []*isoNode
+	pathTableBytes         int
+	pathTableSectors       uint32
+	jolietPathTableLba     uint32
+	jolietPathTableBytes   int
+	jolietPathTableSectors uint32
+	catalogLba             uint32
 
 	bootImageLba  uint32
 	placementsSet bool
@@ -69,8 +74,8 @@ type ElToritoBridge struct {
 }
 
 // NewElToritoBridge creates the layer. volumeSectors is the total image size
-// in 2048-byte sectors. bootImageName is the file name shown at the ISO9660
-// root. bootImageSize is its size in bytes. exposed lists data files to list
+// in 2048-byte sectors. bootImageName is its image-root-relative path.
+// bootImageSize is its size in bytes. exposed lists data files to list
 // in the ISO9660 tree at their image paths; extraDirs lists directories to
 // create even when they would otherwise be empty (directory expansion of
 // --expose). The timestamp follows the iso package's nowFunc convention
@@ -102,8 +107,7 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 	b.root = root
 	// Named so the identifier machinery produces exactly "BOOT.CAT;1".
 	b.catalogNode = &isoNode{name: "boot.cat", dataLength: LogicalSectorBytes, timestamp: b.timestamp, parent: root}
-	b.bootNode = &isoNode{name: bootImageName, dataLength: bootImageSize, timestamp: b.timestamp, parent: root}
-	root.children = []*isoNode{b.catalogNode, b.bootNode}
+	root.children = []*isoNode{b.catalogNode}
 
 	// The exposed files' parent directories are synthesized on demand;
 	// directoryPaths maps each created directory's image path to its node.
@@ -136,6 +140,16 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 			return nil, err
 		}
 	}
+	bootParts := splitImagePath(bootImageName)
+	if len(bootParts) == 0 || bootParts[len(bootParts)-1] == ".." {
+		return nil, fmt.Errorf("Invalid boot image path: %s", bootImageName)
+	}
+	bootParent, err := mkdir(strings.Join(bootParts[:len(bootParts)-1], "/"))
+	if err != nil {
+		return nil, err
+	}
+	b.bootNode = &isoNode{name: bootParts[len(bootParts)-1], dataLength: bootImageSize, timestamp: b.timestamp, parent: bootParent}
+	bootParent.children = append(bootParent.children, b.bootNode)
 	for i := range b.exposed {
 		components := splitImagePath(b.exposed[i].Path)
 		if len(components) == 0 {
@@ -154,6 +168,13 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 		} else {
 			parent = root
 		}
+		if cleanImagePath(b.exposed[i].Path) == cleanImagePath(bootImageName) {
+			if b.exposed[i].Size != bootImageSize {
+				return nil, fmt.Errorf("Boot image size mismatch: %s", bootImageName)
+			}
+			b.exposedNodes = append(b.exposedNodes, b.bootNode)
+			continue
+		}
 		leaf := &isoNode{name: components[len(components)-1], dataLength: b.exposed[i].Size, timestamp: b.timestamp, parent: parent}
 		parent.children = append(parent.children, leaf)
 		b.exposedNodes = append(b.exposedNodes, leaf)
@@ -166,10 +187,29 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 	if err := isoAssignIdentifiers(directories); err != nil {
 		return nil, err
 	}
+	// Joliet-long supports up to 103 UTF-16 code units per name. Do not
+	// silently normalize, truncate or rename paths in the Joliet tree.
+	for _, directory := range directories {
+		used := make(map[string]bool)
+		for _, child := range directory.children {
+			if !utf8.ValidString(child.name) || utf16Length(child.name) > 103 || strings.ContainsAny(child.name, "\x00/\\:;*?") {
+				return nil, fmt.Errorf("Name cannot be represented in Joliet-long: %q", child.name)
+			}
+			identifier := child.name
+			if !child.isDirectory {
+				identifier += ";1"
+			}
+			if used[identifier] {
+				return nil, fmt.Errorf("Duplicate Joliet identifier: %q", child.name)
+			}
+			used[identifier] = true
+			child.jolietIdentifier = identifier
+		}
+	}
 	b.directories = directories
 
-	// Layout: path table at 22, directory extents in path-table order, then
-	// the boot catalog. Everything must fit before the anchor at 256.
+	// Layout: primary path table and directories, Joliet path table and
+	// directories, then the catalog, all before the anchor at 256.
 	b.pathTableBytes = isoPathTableLength(directories, false)
 	b.pathTableSectors = uint32(sectorCount(int64(b.pathTableBytes)))
 	cursor := bridgePathTableLba + b.pathTableSectors
@@ -178,6 +218,15 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 		directory.primaryDirectoryLba = cursor
 		directory.primaryDirectoryBytes = directoryBytes
 		cursor += uint32(sectorCount(int64(directoryBytes)))
+	}
+	b.jolietPathTableBytes = isoPathTableLength(directories, true)
+	b.jolietPathTableSectors = uint32(sectorCount(int64(b.jolietPathTableBytes)))
+	b.jolietPathTableLba = cursor
+	cursor += b.jolietPathTableSectors
+	for _, directory := range directories {
+		directory.jolietDirectoryBytes = isoDirectoryExtentLength(directory, true, false)
+		directory.jolietDirectoryLba = cursor
+		cursor += uint32(sectorCount(int64(directory.jolietDirectoryBytes)))
 	}
 	b.catalogLba = cursor
 	cursor++
@@ -210,6 +259,9 @@ func (b *ElToritoBridge) SetPlacements(bootImageLba uint32, exposedLbas []uint32
 		if err := b.checkPlacement(lba, "exposedLbas"); err != nil {
 			return err
 		}
+		if b.exposedNodes[i] == b.bootNode && lba != bootImageLba {
+			return fmt.Errorf("Exposed boot image must share its boot LBA")
+		}
 		b.exposedNodes[i].dataLba = lba
 	}
 	b.bootImageLba = bootImageLba
@@ -233,7 +285,16 @@ func (b *ElToritoBridge) MetadataExtents() []BridgeMetadataExtent {
 	out := []BridgeMetadataExtent{
 		{Role: "iso9660-pvd", Lba: primaryVolumeDescriptorLba},
 		{Role: "el-torito-record", Lba: bridgeBootRecordLba},
-		{Role: "iso9660-terminator", Lba: terminatorLba},
+		{Role: "joliet-svd", Lba: bridgeSupplementaryLba},
+		{Role: "iso9660-terminator", Lba: bridgeTerminatorLba},
+	}
+	for i := uint32(0); i < b.jolietPathTableSectors; i++ {
+		out = append(out, BridgeMetadataExtent{Role: "joliet-pathtable", Lba: b.jolietPathTableLba + i})
+	}
+	for _, directory := range b.directories {
+		for k := uint32(0); k < uint32(sectorCount(int64(directory.jolietDirectoryBytes))); k++ {
+			out = append(out, BridgeMetadataExtent{Role: "joliet-directory", Lba: directory.jolietDirectoryLba + k})
+		}
 	}
 	for i := uint32(0); i < b.pathTableSectors; i++ {
 		out = append(out, BridgeMetadataExtent{Role: "iso9660-pathtable", Lba: bridgePathTableLba + i})
@@ -275,8 +336,21 @@ func (b *ElToritoBridge) buildSectors() map[uint32][]byte {
 	sectors := map[uint32][]byte{
 		primaryVolumeDescriptorLba: b.buildPrimaryVolumeDescriptor(),
 		bridgeBootRecordLba:        buildBootRecordDescriptor(b.catalogLba),
-		terminatorLba:              isoBuildTerminator(),
+		bridgeSupplementaryLba:     isoBuildVolumeDescriptor(2, b.volumeSectors, b.volumeLabel, b.jolietPathTableBytes, b.jolietPathTableLba, 0, b.root.jolietDirectoryLba, b.root.jolietDirectoryBytes, true, b.timestamp),
+		bridgeTerminatorLba:        isoBuildTerminator(),
 		b.catalogLba:               b.buildBootCatalog(),
+	}
+	jolietTable := isoBuildPathTable(b.directories, true, true)
+	for i := uint32(0); i < b.jolietPathTableSectors; i++ {
+		sector := make([]byte, LogicalSectorBytes)
+		copy(sector, jolietTable[int(i)*LogicalSectorBytes:])
+		sectors[b.jolietPathTableLba+i] = sector
+	}
+	for _, directory := range b.directories {
+		extent := isoBuildDirectoryExtent(directory, true, false)
+		for k := uint32(0); k < uint32(len(extent))/LogicalSectorBytes; k++ {
+			sectors[directory.jolietDirectoryLba+k] = extent[k*LogicalSectorBytes : (k+1)*LogicalSectorBytes]
+		}
 	}
 	table := isoBuildPathTable(b.directories, true, false)
 	for i := uint32(0); i < b.pathTableSectors; i++ {
@@ -294,7 +368,7 @@ func (b *ElToritoBridge) buildSectors() map[uint32][]byte {
 }
 
 // buildPrimaryVolumeDescriptor is iso9660.go's descriptor with the bridge
-// layout: little-endian path table at 22, no big-endian table, and the
+// layout: little-endian path table, no big-endian table, and the
 // dynamically placed root directory extent.
 func (b *ElToritoBridge) buildPrimaryVolumeDescriptor() []byte {
 	return isoBuildVolumeDescriptor(
