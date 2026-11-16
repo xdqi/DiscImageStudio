@@ -1,8 +1,9 @@
 # Disc Image Studio — Go CLI port
 
-This directory contains a Go rewrite of the .NET `disc-image-studio` CLI
-(`src/DiscImageStudio.Cli` and the engine projects behind it), providing the
-same 12 commands with byte-identical output files:
+This directory contains a Go rewrite of the .NET `disc-image-studio` CLI from
+the original [DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio)
+project (`src/DiscImageStudio.Cli` and the engine projects behind it),
+providing the same 12 commands with byte-identical output files:
 
 | Module | Commands |
 | ------ | -------- |
@@ -10,6 +11,22 @@ same 12 commands with byte-identical output files:
 | DVD data disc | `solve`, `encode`, `calibrate`, `simulate`, `selftest` |
 | Blu-ray BD-R | `bd-info`, `bd-probe`, `bd-encode`, `bd-generate` |
 | Calibration | `calibration-target`, `calibrate-ui` |
+
+## New features compared to the original
+
+- **Calibration runs in the browser** (`calibrate-ui`): the photo-based
+  calibration is a pure web app (HTML + JS + CSS, no build step, everything
+  runs locally in the tab), so it is cross-platform — any OS with a browser,
+  no desktop app or .NET runtime needed. See
+  [Calibration (browser UI)](#calibration-browser-ui).
+- **A picture disc can carry actual data mixed into the image**
+  (`solve --filesystem udf|udf-bridge`): the files of a `--data-dir` tree are
+  dispersed into the picture's gray areas as a UDF filesystem — the burned
+  disc shows the image *and* mounts as a normal data disc — optionally with an
+  ISO9660/Joliet + El Torito bridge so it also boots (BIOS and EFI). See
+  [Dispersed hybrid discs (DVD)](#dispersed-hybrid-discs-dvd). For a complete
+  worked example — turning a Debian installer ISO into a bootable picture
+  disc — see [`examples/debian`](examples/debian).
 
 ## Dispersed hybrid discs (DVD)
 
