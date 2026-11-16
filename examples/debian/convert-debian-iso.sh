@@ -205,7 +205,7 @@ echo "generating the picture disc image ..."
 # ---------- 9. Optional simulated read-back preview ----------
 if [ -n "$SIMULATE" ]; then
 	echo "rendering the simulated preview to $SIMULATE ..."
-	"$DIS" simulate "${EXTRA_ARGS[@]}" "${PITCH_ARGS[@]}" --iso "$OUTPUT_ISO" --output "$SIMULATE" \
+	"$DIS" simulate "${PITCH_ARGS[@]}" --iso "$OUTPUT_ISO" --output "$SIMULATE" \
 		--total-sectors "$TOTAL_SECTORS" \
 		--samples-per-sector 1024
 fi
