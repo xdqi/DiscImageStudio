@@ -37,6 +37,7 @@ type bootInfoTablePatch struct {
 	fileIndex int
 	lba       uint32
 	size      int64
+	csum      uint32
 }
 
 func (s *dispersedSectorSource) Content(lba uint32) ([]byte, bool, error) {
@@ -87,7 +88,7 @@ func (s *dispersedSectorSource) Content(lba uint32) ([]byte, bool, error) {
 				}
 			}
 			if s.bootInfo != nil && ext.fileIndex == s.bootInfo.fileIndex && offset == 0 {
-				iso.PatchBootInfoTable(data, s.bootInfo.lba, s.bootInfo.size)
+				iso.PatchBootInfoTable(data, s.bootInfo.lba, s.bootInfo.size, s.bootInfo.csum)
 			}
 			return data, true, nil
 		}

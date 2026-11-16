@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"disc-image-studio/internal/iso"
 	"disc-image-studio/internal/raster"
 )
 
@@ -877,12 +878,9 @@ func TestDispersedUdfBridgeLegacyEndToEnd(t *testing.T) {
 	if got := binary.LittleEndian.Uint32(onDisc[16:20]); got != uint32(len(loader)) {
 		t.Fatalf("bi_length = %d, want %d", got, len(loader))
 	}
-	var want uint32
-	for i := 64; i < sector; i += 4 {
-		want += binary.LittleEndian.Uint32(loader[i:])
-	}
-	if got := binary.LittleEndian.Uint32(onDisc[20:24]); got != want {
-		t.Fatalf("bi_csum = %#x, want %#x", got, want)
+	// bi_csum covers the whole file (verified byte-equal to xorriso).
+	if got := binary.LittleEndian.Uint32(onDisc[20:24]); got != iso.BootInfoTableChecksum(loader) {
+		t.Fatalf("bi_csum = %#x, want %#x", got, iso.BootInfoTableChecksum(loader))
 	}
 	for i := 24; i < 56; i++ {
 		if onDisc[i] != 0 {

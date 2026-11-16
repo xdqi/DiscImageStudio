@@ -508,18 +508,14 @@ func TestElToritoBridgeBootImageRequired(t *testing.T) {
 }
 
 // TestPatchBootInfoTable: the table lands in bytes 8..55 with the PVD/file
-// LBAs, the image length and the checksum of bytes 64..2047; everything else
-// stays untouched.
+// LBAs, the image length and the checksum; everything else stays untouched.
 func TestPatchBootInfoTable(t *testing.T) {
 	sector := make([]byte, LogicalSectorBytes)
 	for i := range sector {
 		sector[i] = byte(i)
 	}
-	var want uint32
-	for i := 64; i < LogicalSectorBytes; i += 4 {
-		want += binary.LittleEndian.Uint32(sector[i:])
-	}
-	PatchBootInfoTable(sector, 300, 1500)
+	want := BootInfoTableChecksum(sector)
+	PatchBootInfoTable(sector, 300, 1500, want)
 	if got := binary.LittleEndian.Uint32(sector[8:12]); got != primaryVolumeDescriptorLba {
 		t.Fatalf("bi_pvd = %d, want %d", got, primaryVolumeDescriptorLba)
 	}
@@ -546,5 +542,25 @@ func TestPatchBootInfoTable(t *testing.T) {
 		if sector[i] != byte(i) {
 			t.Fatalf("byte %d (after the table) was modified", i)
 		}
+	}
+}
+
+// TestBootInfoTableChecksum: the checksum is the little-endian uint32 sum of
+// bytes [64, len) with a zero-padded tail — byte-equal to xorriso/libisofs on
+// these reference vectors (produced by xorriso -boot-info-table).
+func TestBootInfoTableChecksum(t *testing.T) {
+	content3000 := make([]byte, 3000)
+	for i := range content3000 {
+		content3000[i] = byte(i*7 + 3)
+	}
+	if got := BootInfoTableChecksum(content3000); got != 0xd1c3b32e {
+		t.Fatalf("3000-byte checksum = %#x, want 0xd1c3b32e (xorriso reference)", got)
+	}
+	content3001 := append(content3000, byte(11)) // pattern value at i=3000
+	if got := BootInfoTableChecksum(content3001); got != 0xd1c3b339 {
+		t.Fatalf("3001-byte checksum = %#x, want 0xd1c3b339 (xorriso reference)", got)
+	}
+	if got := BootInfoTableChecksum(make([]byte, 100)); got != 0 {
+		t.Fatalf("short/zero checksum = %#x, want 0", got)
 	}
 }

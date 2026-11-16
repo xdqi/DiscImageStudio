@@ -317,12 +317,24 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	}
 	// The legacy BIOS boot image gets its Boot Information Table patched into
 	// bytes 8..55 of its first sector (both UDF and the catalog share the
-	// extent, exactly like mkisofs does).
+	// extent, exactly like mkisofs does). The checksum covers the whole file,
+	// so the content is read once here.
 	if bridge && legacyBootImageIndex >= 0 {
+		content, ok, err := udfPlan.FileContent(legacyBootImageIndex)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			content, err = os.ReadFile(udfPlan.FileSourcePath(legacyBootImageIndex))
+			if err != nil {
+				return err
+			}
+		}
 		source.bootInfo = &bootInfoTablePatch{
 			fileIndex: legacyBootImageIndex,
 			lba:       legacyLba,
 			size:      legacyBootImageSize,
+			csum:      iso.BootInfoTableChecksum(content),
 		}
 	}
 	var extents []fileExtent

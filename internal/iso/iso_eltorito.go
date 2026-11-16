@@ -507,22 +507,38 @@ func (b *ElToritoBridge) buildBootCatalog() []byte {
 	return sector
 }
 
+// BootInfoTableChecksum computes the El Torito Boot Information Table's
+// bi_csum of a boot file: the sum of all little-endian uint32 words from
+// byte 64 to the end of the file (bi_length), the last partial word
+// zero-padded (verified byte-equal to xorriso/libisofs).
+func BootInfoTableChecksum(content []byte) uint32 {
+	var sum uint32
+	for i := 64; i < len(content); i += 4 {
+		word := content[i:]
+		if len(word) > 4 {
+			word = word[:4]
+		}
+		var v uint32
+		for j := 0; j < len(word); j++ {
+			v |= uint32(word[j]) << (8 * j)
+		}
+		sum += v
+	}
+	return sum
+}
+
 // PatchBootInfoTable writes the El Torito Boot Information Table of a legacy
 // BIOS no-emulation boot image into bytes 8..55 of its first 2048-byte
 // sector: bi_pvd (LBA of the Primary Volume Descriptor), bi_file (the boot
-// image's LBA), bi_length (image size in bytes), and bi_csum (the sum of all
-// little-endian uint32 words of bytes 64..2047, computed over the unpatched
-// content). The reserved bytes 24..55 are zeroed.
-func PatchBootInfoTable(firstSector []byte, fileLba uint32, imageSize int64) {
+// image's LBA), bi_length (image size in bytes), and bi_csum (see
+// BootInfoTableChecksum — it covers the WHOLE file, not just this sector).
+// The reserved bytes 24..55 are zeroed.
+func PatchBootInfoTable(firstSector []byte, fileLba uint32, imageSize int64, checksum uint32) {
 	for i := 8; i < 56; i++ {
 		firstSector[i] = 0
 	}
 	binary.LittleEndian.PutUint32(firstSector[8:], primaryVolumeDescriptorLba)
 	binary.LittleEndian.PutUint32(firstSector[12:], fileLba)
 	binary.LittleEndian.PutUint32(firstSector[16:], uint32(imageSize))
-	var sum uint32
-	for i := 64; i < LogicalSectorBytes; i += 4 {
-		sum += binary.LittleEndian.Uint32(firstSector[i:])
-	}
-	binary.LittleEndian.PutUint32(firstSector[20:], sum)
+	binary.LittleEndian.PutUint32(firstSector[20:], checksum)
 }
