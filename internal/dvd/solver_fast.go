@@ -389,7 +389,12 @@ func generateFastBlock(blockIndex int, sampler *payloadImageSampler, options mul
 					// each byte's original absolute index and sector mask.
 					sample := sampler.mapSample(cachedSample, toneIndexBase+int64(byteIndex))
 					if sample.alpha >= options.ImageMapping.AlphaThreshold {
-						sectorPayload[byteIndex] = sample.scrambledByte ^ scrambler[byteIndex]
+						if sample.gray {
+							// Zero payload scrambles to the same mid-gray noise as data.
+							sectorPayload[byteIndex] = 0
+						} else {
+							sectorPayload[byteIndex] = sample.scrambledByte ^ scrambler[byteIndex]
+						}
 						if options.ReadCompatibility {
 							ownership[byteIndex] = 1
 						}
@@ -422,7 +427,12 @@ func generateFastBlock(blockIndex int, sampler *payloadImageSampler, options mul
 				if sample.alpha < options.ImageMapping.AlphaThreshold {
 					continue
 				}
-				sectorPayload[byteIndex] = sample.scrambledByte ^ scrambler[byteIndex]
+				if sample.gray {
+					// Zero payload scrambles to the same mid-gray noise as data.
+					sectorPayload[byteIndex] = 0
+				} else {
+					sectorPayload[byteIndex] = sample.scrambledByte ^ scrambler[byteIndex]
+				}
 				if options.ReadCompatibility {
 					ownership[byteIndex] = 1
 				}
@@ -493,6 +503,11 @@ func fastDispersionValidate(options multiBlockSolveOptions) error {
 type payloadTarget struct {
 	scrambledByte byte
 	alpha         byte
+	// gray marks bytes whose pixel is inside the dispersed writer's gray
+	// band: they render as gray noise (zero payload — the payload scrambler
+	// turns it into the same mid-gray as data) instead of a black/white
+	// picture tone.
+	gray bool
 }
 
 // payloadImageSampler ports the nested PayloadImageSampler (raster/analytic
@@ -511,6 +526,13 @@ type payloadImageSampler struct {
 	reusePositionMargin     float64
 	reuseTangentMargin      float64
 	reuseQuadraticBound     float64
+
+	// grayRenderBand, when non-nil, renders in-band pixels as gray noise
+	// (zero payload) instead of the black/white palette. Only the dispersed
+	// writer sets this: there gray is the data tone, so a protected sector
+	// crossing a picture feature keeps its black/white strokes while its
+	// background blends into the surrounding data field.
+	grayRenderBand *[2]byte
 }
 
 func newPayloadImageSamplerFromImage(image *rasterImage, options imageMappingOptions) (*payloadImageSampler, error) {
@@ -620,7 +642,8 @@ func (s *payloadImageSampler) safeTravel(distance, outwardTangent float64) float
 }
 
 func (s *payloadImageSampler) mapSample(sample pixelSample, toneIndex int64) payloadTarget {
-	return payloadTarget{scrambledByte: s.scrambledForLuminance(sample.Luminance, toneIndex), alpha: sample.Alpha}
+	scrambled, gray := s.scrambledForLuminance(sample.Luminance, toneIndex)
+	return payloadTarget{scrambledByte: scrambled, alpha: sample.Alpha, gray: gray}
 }
 
 func (s *payloadImageSampler) sampleRasterPoint(x, y float64) pixelSample {
@@ -653,17 +676,27 @@ func (s *payloadImageSampler) samplePoint(radiusMm, polarAngle, trackAngle float
 	} else {
 		sample = s.sampleRasterPoint(xMm, yMm)
 	}
-	return payloadTarget{scrambledByte: s.scrambledForLuminance(sample.Luminance, toneIndex), alpha: sample.Alpha}
+	scrambled, gray := s.scrambledForLuminance(sample.Luminance, toneIndex)
+	return payloadTarget{scrambledByte: scrambled, alpha: sample.Alpha, gray: gray}
 }
 
-func (s *payloadImageSampler) scrambledForLuminance(luminance byte, toneIndex int64) byte {
+// setGrayRenderBand makes in-band pixels render as gray noise (zero payload)
+// instead of the black/white palette. Used only by the dispersed UDF writer.
+func (s *payloadImageSampler) setGrayRenderBand(band [2]byte) {
+	s.grayRenderBand = &[2]byte{band[0], band[1]}
+}
+
+func (s *payloadImageSampler) scrambledForLuminance(luminance byte, toneIndex int64) (byte, bool) {
+	if band := s.grayRenderBand; band != nil && luminance >= band[0] && luminance <= band[1] {
+		return 0, true
+	}
 	if tone := s.options.Tone; tone != nil && !tone.IsLegacyBinary() {
 		if dvdToneUseWhite(luminance, s.options.LuminanceThreshold, tone, toneIndex) {
-			return dvdWhiteScrambledByte
+			return dvdWhiteScrambledByte, false
 		}
-		return dvdBlackScrambledByte
+		return dvdBlackScrambledByte, false
 	}
-	return dvdGetScrambledByte(luminance)
+	return dvdGetScrambledByte(luminance), false
 }
 
 func processorCount() int {

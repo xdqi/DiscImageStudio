@@ -378,6 +378,11 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		output.Close()
 		return err
 	}
+	// In the dispersed rendering gray is the data tone: pixels inside the
+	// settled gray band render as gray noise (zero payload), so a protected
+	// sector keeps only its black/white strokes and the background stays a
+	// uniform data field.
+	sampler.setGrayRenderBand(plan.band)
 	progressEvery := maxInt(1, int(options.FillSectors/dvdEccSectorCount)/100)
 	summary, err := writeDispersedIso(sampler, output, options, source, func(p fastDvdStreamProgress) {
 		if p.CompletedBlocks == 1 || p.CompletedBlocks == p.TotalBlocks || p.CompletedBlocks%progressEvery == 0 {

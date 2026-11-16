@@ -844,6 +844,72 @@ func TestPlanDispersionRelaxesHeadroom(t *testing.T) {
 	}
 }
 
+// TestGrayBandRendering: with the dispersed writer's gray-render band set,
+// in-band pixels render as zero payload (the payload scrambler turns that
+// into the same mid-gray noise as data); out-of-band pixels keep the
+// black/white palette.
+func TestGrayBandRendering(t *testing.T) {
+	mapping := imageMappingOptions{
+		TotalSectors:       4096,
+		InnerRadiusMm:      24,
+		OuterRadiusMm:      58,
+		ChannelBitLengthNm: 133.3,
+	}
+	cases := []struct {
+		name string
+		lum  byte
+		band *[2]byte
+		gray bool // want zero payload; else the scrambled palette byte ^ mask
+	}{
+		{"no band renders binary", 130, nil, false},
+		{"in-band renders gray", 130, &[2]byte{120, 136}, true},
+		{"below band stays black", 100, &[2]byte{120, 136}, false},
+		{"above band stays white", 200, &[2]byte{120, 136}, false},
+	}
+	for _, reuse := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				img := rasterImageCreateForTest(64, 64, tc.lum, tc.lum, tc.lum, 255)
+				sampler, err := newPayloadImageSamplerFromImage(img, mapping)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.band != nil {
+					sampler.setGrayRenderBand(*tc.band)
+				}
+				options := multiBlockSolveOptions{
+					FillSectors:        dvdEccSectorCount,
+					ZeroInitialPayload: true,
+					UseSampleReuse:     reuse,
+					ImageMapping:       mapping,
+				}
+				payloads := make([]byte, dvdPayloadBytesPerBlock)
+				block, err := generateFastBlock(0, sampler, options, payloads)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for sector := 0; sector < dvdEccSectorCount; sector++ {
+					mask := payloadScramblerMask(uint32(sector)) // StartLba=0, PsnOffset=0
+					for i := 0; i < dvdPayloadBytesPerSector; i++ {
+						got := block.payloads[sector*dvdPayloadBytesPerSector+i]
+						want := byte(0)
+						if !tc.gray {
+							palette := byte(dvdWhiteScrambledByte)
+							if tc.lum < 128 {
+								palette = dvdBlackScrambledByte
+							}
+							want = palette ^ mask[i]
+						}
+						if got != want {
+							t.Fatalf("sector %d byte %d = %#02x, want %#02x", sector, i, got, want)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestDispersedUdfBridgeLegacyEndToEnd: --legacy-boot-image writes the x86
 // legacy BIOS default entry (no-emulation, load size rounded up to 2 KiB)
 // and patches a Boot Information Table into the boot image's on-disc content
