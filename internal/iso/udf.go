@@ -40,6 +40,11 @@ type udfNode struct {
 	entryLba    uint32
 	dataLba     uint32
 	dataLength  int64
+	// Symlinks (UDF file type 12) store the target as CS0 path components at
+	// their data extent, like a regular file's content.
+	isSymlink   bool
+	linkTarget  string
+	linkContent []byte
 }
 
 // planUdf ports UdfImageWriter.Plan. An empty sourceDirectory is the C#
@@ -87,9 +92,7 @@ func planUdf(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 		}
 		for _, entry := range entries {
 			fullName := filepath.Join(directory.sourcePath, entry.name)
-			if entry.info.Mode()&os.ModeSymlink != 0 {
-				return nil, fmt.Errorf("Reparse points are not supported in the UDF data directory: %s", fullName)
-			}
+			isSymlink := entry.info.Mode()&os.ModeSymlink != 0
 			isDirectory := entry.info.IsDir()
 			identifier, err := udfEncodeIdentifier(entry.name)
 			if err != nil {
@@ -103,8 +106,21 @@ func planUdf(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 				identifier:  identifier,
 				timestamp:   entry.info.ModTime().UTC(),
 				uniqueId:    uint64(len(nodes)) + 15,
+				isSymlink:   isSymlink,
 			}
-			if !isDirectory {
+			if isSymlink {
+				target, err := os.Readlink(fullName)
+				if err != nil {
+					return nil, err
+				}
+				content, err := udfEncodeSymlinkTarget(target)
+				if err != nil {
+					return nil, err
+				}
+				child.linkTarget = target
+				child.linkContent = content
+				child.dataLength = int64(len(content))
+			} else if !isDirectory {
 				child.dataLength = entry.info.Size()
 			}
 			directory.children = append(directory.children, child)
@@ -537,6 +553,8 @@ func udfFileEntry(plan *UdfLayoutPlan, node *udfNode) []byte {
 	udfU16(data, 24, 1)
 	if node.isDirectory {
 		data[27] = 4
+	} else if node.isSymlink {
+		data[27] = 12 // symbolic link
 	} else {
 		data[27] = 5
 	}
@@ -624,6 +642,67 @@ func udfFileIdentifierLength(identifierBytes int, directoryOffset int64) int {
 		return length + 32
 	}
 	return length
+}
+
+// udfEncodeSymlinkTarget encodes a link target as UDF path components
+// (ECMA-167 4/14.16.2), matching the Linux fs/udf/symlink.c reading: records
+// of {componentType, lengthComponentIdent, componentFileVersionNum u16le,
+// componentIdent} with type 1=root, 3="..", 4=".", 5=name (CS0 ident).
+func udfEncodeSymlinkTarget(target string) ([]byte, error) {
+	var out []byte
+	appendComponent := func(componentType byte, ident []byte) error {
+		if len(ident) > 255 {
+			return fmt.Errorf("UDF symlink path component too long: %s", target)
+		}
+		out = append(out, componentType, byte(len(ident)), 0, 0)
+		out = append(out, ident...)
+		return nil
+	}
+	rest := target
+	for len(rest) > 0 {
+		if strings.HasPrefix(rest, "/") {
+			// Root (or collapse "//"): one leading slash marks the volume root.
+			if len(out) == 0 {
+				if err := appendComponent(1, nil); err != nil {
+					return nil, err
+				}
+			}
+			rest = strings.TrimLeft(rest, "/")
+			continue
+		}
+		end := strings.IndexByte(rest, '/')
+		var component string
+		if end < 0 {
+			component, rest = rest, ""
+		} else {
+			component, rest = rest[:end], rest[end+1:]
+		}
+		switch component {
+		case "", ".":
+			if err := appendComponent(4, nil); err != nil {
+				return nil, err
+			}
+		case "..":
+			if err := appendComponent(3, nil); err != nil {
+				return nil, err
+			}
+		default:
+			ident, err := udfEncodeIdentifier(component)
+			if err != nil {
+				return nil, err
+			}
+			if err := appendComponent(5, ident); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("UDF symlink target is empty: %s", target)
+	}
+	if len(out) > LogicalSectorBytes {
+		return nil, fmt.Errorf("UDF symlink target does not fit one logical block: %s", target)
+	}
+	return out, nil
 }
 
 // udfEncodeIdentifier ports UdfImageWriter.EncodeIdentifier (CS0 compressed
@@ -840,7 +919,8 @@ func udfValidateSources(plan *UdfLayoutPlan, ctx context.Context) error {
 					return fmt.Errorf("Source directory changed after UDF planning: %s", node.sourcePath)
 				}
 				child, ok := expected[entry.Name()]
-				if entryInfo.Mode()&os.ModeSymlink != 0 || !ok || entryInfo.IsDir() != child.isDirectory {
+				isSymlinkNow := entryInfo.Mode()&os.ModeSymlink != 0
+				if !ok || entryInfo.IsDir() != child.isDirectory || isSymlinkNow != child.isSymlink {
 					return fmt.Errorf("Source directory changed after UDF planning: %s", node.sourcePath)
 				}
 				count++
@@ -862,6 +942,13 @@ func udfValidateFile(file *udfNode) error {
 		if err := udfRejectReparsePoint(directory.sourcePath); err != nil {
 			return err
 		}
+	}
+	if file.isSymlink {
+		target, err := os.Readlink(file.sourcePath)
+		if err != nil || target != file.linkTarget {
+			return fmt.Errorf("Source file changed after UDF planning: %s", file.sourcePath)
+		}
+		return nil
 	}
 	info, err := os.Lstat(file.sourcePath)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || info.IsDir() ||
@@ -914,6 +1001,9 @@ func (w *udfSequentialWriter) writeFile(file *udfNode) error {
 	}
 	if err := udfValidateFile(file); err != nil {
 		return err
+	}
+	if file.isSymlink {
+		return w.write(file.linkContent)
 	}
 	input, err := os.Open(file.sourcePath)
 	if err != nil {

@@ -104,9 +104,7 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 		}
 		for _, entry := range entries {
 			fullName := filepath.Join(directory.sourcePath, entry.name)
-			if entry.info.Mode()&os.ModeSymlink != 0 {
-				return nil, fmt.Errorf("Reparse points are not supported in the UDF data directory: %s", fullName)
-			}
+			isSymlink := entry.info.Mode()&os.ModeSymlink != 0
 			isDirectory := entry.info.IsDir()
 			identifier, err := udfEncodeIdentifier(entry.name)
 			if err != nil {
@@ -120,8 +118,21 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 				identifier:  identifier,
 				timestamp:   entry.info.ModTime().UTC(),
 				uniqueId:    uint64(len(nodes)) + 15,
+				isSymlink:   isSymlink,
 			}
-			if !isDirectory {
+			if isSymlink {
+				target, err := os.Readlink(fullName)
+				if err != nil {
+					return nil, err
+				}
+				content, err := udfEncodeSymlinkTarget(target)
+				if err != nil {
+					return nil, err
+				}
+				child.linkTarget = target
+				child.linkContent = content
+				child.dataLength = int64(len(content))
+			} else if !isDirectory {
 				child.dataLength = entry.info.Size()
 			}
 			directory.children = append(directory.children, child)
@@ -270,8 +281,14 @@ func (p *UdfDispersedPlan) FileSize(index int) int64 { return p.files[index].dat
 // FileName returns the UDF file name of file index.
 func (p *UdfDispersedPlan) FileName(index int) string { return p.files[index].name }
 
-// FileSourcePath returns the source path of file index, "" for extras.
-func (p *UdfDispersedPlan) FileSourcePath(index int) string { return p.files[index].sourcePath }
+// FileSourcePath returns the source path of file index, "" for extras and
+// symlinks (their content comes from FileContent instead).
+func (p *UdfDispersedPlan) FileSourcePath(index int) string {
+	if p.files[index].isSymlink {
+		return ""
+	}
+	return p.files[index].sourcePath
+}
 
 // FileContent returns the in-memory content for an extra file, caching the
 // Fill result. ok=false for tree files (read those from their source path).
@@ -281,6 +298,10 @@ func (p *UdfDispersedPlan) FileContent(index int) (content []byte, ok bool, err 
 		return nil, false, fmt.Errorf("File index out of range. (Parameter 'index')")
 	}
 	if index < treeCount {
+		node := p.files[index]
+		if node.isSymlink {
+			return node.linkContent, true, nil
+		}
 		return nil, false, nil
 	}
 	extra := p.extras[index-treeCount]
@@ -534,6 +555,8 @@ func udfDispersedFileEntry(plan *UdfLayoutPlan, node *udfNode, extents []UdfFile
 	udfU16(data, 24, 1)
 	if node.isDirectory {
 		data[27] = 4
+	} else if node.isSymlink {
+		data[27] = 12 // symbolic link
 	} else {
 		data[27] = 5
 	}

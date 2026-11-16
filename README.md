@@ -36,6 +36,21 @@ Knobs: `--gray-band T1:T2` (manual luminance band; default widens from
 records the resolved constraint list (`{"role","length","fixedAt"}`) and the
 per-file fragment placements.
 
+## Symlinks
+
+`--data-dir` trees may contain symlinks; they are stored as links (not
+followed, not rejected):
+
+- **UDF** (BD `--data-dir`, DVD `--filesystem udf|udf-bridge`): UDF file type 12
+  with CS0 path components, per ECMA-167 and the Linux `fs/udf` reader.
+- **ISO9660** (CD/DVD hybrid `--data-dir`): Rock Ridge `SL` entries (+ `SP`/`ER`
+  markers, and `PX` with `S_IFLNK|0777` so readers recognize the type) — only
+  when the tree actually contains symlinks, so images without links stay
+  byte-identical to earlier versions.
+
+A symlinked top-level `--data-dir` path itself is still rejected (pass the
+resolved path).
+
 Every command supports `--help` (alias `-h`), e.g. `disc-image-studio
 cd-generate --help`, which prints the command's options with types, defaults,
 units and choices. `disc-image-studio help COMMAND` is equivalent.

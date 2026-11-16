@@ -56,6 +56,9 @@ type IsoLayoutPlan struct {
 	primaryVolumeLabel string
 	jolietVolumeLabel  string
 	timestamp          time.Time
+	// hasSymlinks enables the Rock Ridge SL/SUSP fields (only then, so images
+	// without symlinks stay byte-identical to before).
+	hasSymlinks bool
 }
 
 func (p *IsoLayoutPlan) SourceDirectory() string         { return p.sourceDirectory }

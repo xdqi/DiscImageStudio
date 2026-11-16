@@ -166,6 +166,8 @@ type isoNode struct {
 	dataLba               uint32
 	dataLength            int64
 	timestamp             time.Time
+	isSymlink             bool
+	linkTarget            string
 }
 
 // isoLayout ports Iso9660ImageWriter.Layout.
@@ -230,7 +232,8 @@ func planIso(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 	if err := isoAssignIdentifiers(directories); err != nil {
 		return nil, err
 	}
-	layout, err := isoBuildLayout(directories, volumeSectors, filesAtOuterRing)
+	hasSymlinks := isoTreeHasSymlinks(root)
+	layout, err := isoBuildLayout(directories, volumeSectors, filesAtOuterRing, hasSymlinks)
 	if err != nil {
 		return nil, err
 	}
@@ -256,6 +259,7 @@ func planIso(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 		primaryVolumeLabel:      primaryVolumeLabel,
 		jolietVolumeLabel:       jolietVolumeLabel,
 		timestamp:               timestamp,
+		hasSymlinks:             hasSymlinks,
 	}, nil
 }
 
@@ -409,7 +413,7 @@ func isoWriteMetadata(plan *IsoLayoutPlan, output *sequentialIsoWriter) error {
 	for _, directory := range plan.directories {
 		if err := output.writeAtLba(
 			directory.primaryDirectoryLba,
-			isoBuildDirectoryExtent(directory, false)); err != nil {
+			isoBuildDirectoryExtent(directory, false, plan.hasSymlinks)); err != nil {
 			return err
 		}
 	}
@@ -417,7 +421,7 @@ func isoWriteMetadata(plan *IsoLayoutPlan, output *sequentialIsoWriter) error {
 	for _, directory := range plan.directories {
 		if err := output.writeAtLba(
 			directory.jolietDirectoryLba,
-			isoBuildDirectoryExtent(directory, true)); err != nil {
+			isoBuildDirectoryExtent(directory, true, plan.hasSymlinks)); err != nil {
 			return err
 		}
 	}
@@ -457,7 +461,19 @@ func isoPopulateDirectory(directory *isoNode) error {
 	for _, entry := range entries {
 		fullName := filepath.Join(directory.sourcePath, entry.name)
 		if entry.info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("Reparse points are not supported in --data-dir: %s", fullName)
+			target, err := os.Readlink(fullName)
+			if err != nil {
+				return err
+			}
+			directory.children = append(directory.children, &isoNode{
+				sourcePath: fullName,
+				name:       entry.name,
+				parent:     directory,
+				isSymlink:  true,
+				linkTarget: target,
+				timestamp:  entry.info.ModTime().UTC(),
+			})
+			continue
 		}
 
 		if entry.info.IsDir() {
@@ -550,7 +566,7 @@ func isoAssignIdentifiers(directories []*isoNode) error {
 	return nil
 }
 
-func isoBuildLayout(directories []*isoNode, volumeSectors uint32, filesAtOuterRing bool) (isoLayout, error) {
+func isoBuildLayout(directories []*isoNode, volumeSectors uint32, filesAtOuterRing bool, planHasSymlinks bool) (isoLayout, error) {
 	var layout isoLayout
 	primaryPathTableBytes := isoPathTableLength(directories, false)
 	jolietPathTableBytes := isoPathTableLength(directories, true)
@@ -581,7 +597,7 @@ func isoBuildLayout(directories []*isoNode, volumeSectors uint32, filesAtOuterRi
 	}
 
 	for _, directory := range directories {
-		directory.primaryDirectoryBytes = isoDirectoryExtentLength(directory, false)
+		directory.primaryDirectoryBytes = isoDirectoryExtentLength(directory, false, planHasSymlinks)
 		directory.primaryDirectoryLba, err = allocate(int64(directory.primaryDirectoryBytes))
 		if err != nil {
 			return layout, err
@@ -589,7 +605,7 @@ func isoBuildLayout(directories []*isoNode, volumeSectors uint32, filesAtOuterRi
 	}
 
 	for _, directory := range directories {
-		directory.jolietDirectoryBytes = isoDirectoryExtentLength(directory, true)
+		directory.jolietDirectoryBytes = isoDirectoryExtentLength(directory, true, planHasSymlinks)
 		directory.jolietDirectoryLba, err = allocate(int64(directory.jolietDirectoryBytes))
 		if err != nil {
 			return layout, err
@@ -651,14 +667,22 @@ func isoPathTableLength(directories []*isoNode, joliet bool) int {
 	return length
 }
 
-func isoDirectoryExtentLength(directory *isoNode, joliet bool) int {
+func isoDirectoryExtentLength(directory *isoNode, joliet bool, hasSymlinks bool) int {
+	rootSua := 0
+	if directory.parent == nil && hasSymlinks {
+		rootSua = len(isoSuspSP) + len(isoRripER())
+	}
 	recordLengths := []int{
-		isoDirectoryRecordLength(1),
+		isoDirectoryRecordLength(1) + rootSua,
 		isoDirectoryRecordLength(1),
 	}
 	for _, child := range directory.children {
+		sua := 0
+		if child.isSymlink {
+			sua = len(isoRripPxSymlink()) + len(isoSymlinkSystemUse(child.linkTarget))
+		}
 		recordLengths = append(recordLengths,
-			isoDirectoryRecordLength(len(isoIdentifierBytes(child, joliet))))
+			isoDirectoryRecordLength(len(isoIdentifierBytes(child, joliet)))+sua)
 	}
 	return isoPackedRecordLength(recordLengths)
 }
@@ -712,7 +736,7 @@ func isoBuildPathTable(directories []*isoNode, littleEndian bool, joliet bool) [
 	return table
 }
 
-func isoBuildDirectoryExtent(directory *isoNode, joliet bool) []byte {
+func isoBuildDirectoryExtent(directory *isoNode, joliet bool, hasSymlinks bool) []byte {
 	extentBytes := directory.primaryDirectoryBytes
 	currentLba := directory.primaryDirectoryLba
 	if joliet {
@@ -731,12 +755,17 @@ func isoBuildDirectoryExtent(directory *isoNode, joliet bool) []byte {
 		parentLba = parent.jolietDirectoryLba
 		parentBytes = parent.jolietDirectoryBytes
 	}
-	offset = isoAddDirectoryRecord(extent, offset, isoBuildDirectoryRecord(
+	var rootSua []byte
+	if directory.parent == nil && hasSymlinks {
+		rootSua = append(append([]byte(nil), isoSuspSP...), isoRripER()...)
+	}
+	offset = isoAddDirectoryRecord(extent, offset, isoBuildDirectoryRecordSusp(
 		currentLba,
 		int64(extentBytes),
 		true,
 		[]byte{0},
-		directory.timestamp))
+		directory.timestamp,
+		rootSua))
 	offset = isoAddDirectoryRecord(extent, offset, isoBuildDirectoryRecord(
 		parentLba,
 		int64(parentBytes),
@@ -757,12 +786,17 @@ func isoBuildDirectoryExtent(directory *isoNode, joliet bool) []byte {
 			childLba = child.dataLba
 			childBytes = child.dataLength
 		}
-		offset = isoAddDirectoryRecord(extent, offset, isoBuildDirectoryRecord(
+		var sua []byte
+		if child.isSymlink {
+			sua = append(isoRripPxSymlink(), isoSymlinkSystemUse(child.linkTarget)...)
+		}
+		offset = isoAddDirectoryRecord(extent, offset, isoBuildDirectoryRecordSusp(
 			childLba,
 			childBytes,
 			child.isDirectory,
 			isoIdentifierBytes(child, joliet),
-			child.timestamp))
+			child.timestamp,
+			sua))
 	}
 
 	return extent
@@ -839,7 +873,20 @@ func isoBuildDirectoryRecord(
 	isDirectory bool,
 	identifier []byte,
 	timestamp time.Time) []byte {
-	length := isoDirectoryRecordLength(len(identifier))
+	return isoBuildDirectoryRecordSusp(extentLba, dataLength, isDirectory, identifier, timestamp, nil)
+}
+
+// isoBuildDirectoryRecordSusp is isoBuildDirectoryRecord plus a SUSP system
+// use area (Rock Ridge SL entries for symlinks; SP/ER on the root's "." when
+// the image contains symlinks).
+func isoBuildDirectoryRecordSusp(
+	extentLba uint32,
+	dataLength int64,
+	isDirectory bool,
+	identifier []byte,
+	timestamp time.Time,
+	systemUse []byte) []byte {
+	length := isoDirectoryRecordLength(len(identifier)) + len(systemUse)
 	record := make([]byte, length)
 	record[0] = byte(length)
 	isoWriteBothEndian32(record, 2, extentLba)
@@ -851,6 +898,7 @@ func isoBuildDirectoryRecord(
 	isoWriteBothEndian16(record, 28, 1)
 	record[32] = byte(len(identifier))
 	copy(record[33:], identifier)
+	copy(record[length-len(systemUse):], systemUse)
 	return record
 }
 
@@ -862,12 +910,154 @@ func isoDirectoryRecordLength(identifierBytes int) int {
 	return 33 + identifierBytes + pad
 }
 
+// --- Rock Ridge (SUSP/RRIP) ---
+
+// The SP check entry for the root directory's "." record (SUSP 1.12).
+var isoSuspSP = []byte{'S', 'P', 7, 1, 0xBE, 0xEF, 0}
+
+// The RRIP PX entry (POSIX attributes) for a symlink: mode S_IFLNK|0777 —
+// readers recognize a record as a symlink only through its POSIX mode.
+func isoRripPxSymlink() []byte {
+	entry := make([]byte, 44)
+	entry[0] = 'P'
+	entry[1] = 'X'
+	entry[2] = 44
+	entry[3] = 1
+	writeBothEndian32 := func(offset int, value uint32) {
+		binary.LittleEndian.PutUint32(entry[offset:], value)
+		binary.BigEndian.PutUint32(entry[offset+4:], value)
+	}
+	writeBothEndian32(4, 0o120777) // S_IFLNK | 0777
+	writeBothEndian32(12, 1)       // links
+	writeBothEndian32(20, 0)       // uid
+	writeBothEndian32(28, 0)       // gid
+	writeBothEndian32(36, 1)       // serial
+	return entry
+}
+
+// The RRIP 1.12 extension reference (ER), following xorriso's conventions.
+func isoRripER() []byte {
+	const id = "RRIP_1991A"
+	const descriptor = "THE ROCK RIDGE INTERCHANGE PROTOCOL PROVIDES STANDARD POSIX FILE SYSTEM SEMANTICS"
+	const source = "IEEE_P1282"
+	length := 8 + len(id) + len(descriptor) + len(source)
+	entry := make([]byte, 0, length)
+	entry = append(entry, 'E', 'R', byte(length), 1, byte(len(id)), byte(len(descriptor)), byte(len(source)), 1)
+	entry = append(entry, id...)
+	entry = append(entry, descriptor...)
+	entry = append(entry, source...)
+	return entry
+}
+
+// isoSymlinkSystemUse builds the Rock Ridge SL entries for a link target,
+// continuing across entries when a component would exceed the 255-byte limit.
+func isoSymlinkSystemUse(target string) []byte {
+	type component struct {
+		flags   byte
+		content []byte
+	}
+	var components []component
+	rest := target
+	for len(rest) > 0 {
+		if strings.HasPrefix(rest, "/") {
+			if len(components) == 0 {
+				components = append(components, component{flags: 0x08})
+			}
+			rest = strings.TrimLeft(rest, "/")
+			continue
+		}
+		end := strings.IndexByte(rest, '/')
+		var name string
+		if end < 0 {
+			name, rest = rest, ""
+		} else {
+			name, rest = rest[:end], rest[end+1:]
+		}
+		switch name {
+		case "":
+			continue
+		case ".":
+			components = append(components, component{flags: 0x02})
+		case "..":
+			components = append(components, component{flags: 0x04})
+		default:
+			components = append(components, component{flags: 0x00, content: []byte(name)})
+		}
+	}
+
+	// Flatten the components into chunk records; a component longer than a
+	// chunk capacity is split, marking all but its last chunk CONTINUE (0x01).
+	type chunk struct {
+		flags     byte
+		continue_ bool
+		content   []byte
+	}
+	var chunks []chunk
+	for _, comp := range components {
+		content := comp.content
+		for {
+			take := min(len(content), 248)
+			c := chunk{flags: comp.flags, content: content[:take]}
+			content = content[take:]
+			if len(content) > 0 {
+				c.flags |= 0x01 // component continues in the next chunk
+			}
+			chunks = append(chunks, c)
+			if len(content) == 0 {
+				break
+			}
+		}
+	}
+	// Pack chunks into SL entries of at most 250 bytes of content.
+	var out []byte
+	for i := 0; i < len(chunks); {
+		entry := []byte{}
+		more := false
+		for i < len(chunks) {
+			need := 2 + len(chunks[i].content)
+			if len(entry)+need > 250 {
+				more = true
+				break
+			}
+			entry = append(entry, chunks[i].flags, byte(len(chunks[i].content)))
+			entry = append(entry, chunks[i].content...)
+			i++
+		}
+		more = more || i < len(chunks)
+		length := 5 + len(entry)
+		flags := byte(0)
+		if more {
+			flags = 1 // the link target continues in the next SL entry
+		}
+		out = append(out, 'S', 'L', byte(length), 1, flags)
+		out = append(out, entry...)
+	}
+	return out
+}
+
 func isoIdentifierBytes(node *isoNode, joliet bool) []byte {
 	if joliet {
 		return bigEndianUnicode(node.jolietIdentifier)
 	}
 	// Primary identifiers are normalized to pure ASCII.
 	return []byte(node.primaryIdentifier)
+}
+
+// isoTreeHasSymlinks reports whether the tree contains any symlink.
+func isoTreeHasSymlinks(root *isoNode) bool {
+	var walk func(node *isoNode) bool
+	walk = func(node *isoNode) bool {
+		for _, child := range node.children {
+			if child.isSymlink {
+				return true
+			}
+			if child.isDirectory && walk(child) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(root)
 }
 
 func isoEnumerateFiles(root *isoNode) []*isoNode {
@@ -924,6 +1114,13 @@ func isoTryAddUsed(used map[string]struct{}, candidate string) bool {
 }
 
 func isoValidateSourceFile(file *isoNode) error {
+	if file.isSymlink {
+		target, err := os.Readlink(file.sourcePath)
+		if err != nil || target != file.linkTarget {
+			return fmt.Errorf("Source file changed after ISO planning: %s", file.sourcePath)
+		}
+		return nil
+	}
 	info, err := os.Lstat(file.sourcePath)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || info.IsDir() ||
 		info.Size() != file.dataLength ||
