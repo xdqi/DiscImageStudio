@@ -20,6 +20,12 @@ const (
 	// per turn. Used only for the interior-of-flat-area morphology.
 	erosionArcBins  = 256
 	erosionMmPerRad = 0.05
+
+	// A pixel outside [hardFeatureLo, hardFeatureHi] is a hard feature: it can
+	// never become data tone, because the planner never widens the gray band
+	// past these limits.
+	hardFeatureLo = 64
+	hardFeatureHi = 192
 )
 
 // disperseToneMap is the sampled tone model of the disc.
@@ -37,6 +43,11 @@ type disperseToneMap struct {
 	sectorSampleStride int
 	alphaThreshold     byte
 	lumThreshold       byte
+
+	// tainted marks sectors whose rendered bytes touch a hard-feature pixel
+	// (exact per-byte walk at the writer's own sample positions); they may
+	// never hold data regardless of the coarse statistics.
+	tainted []bool
 
 	// Polar erosion grid: turns × arcs, cell center luminance.
 	gridTurns int
@@ -76,6 +87,13 @@ func buildDisperseToneMap(image *rasterImage, options imageMappingOptions) (*dis
 	steps := int(math.Ceil(2*m.sectorArcMm*pxPerMm)) + 1
 	m.sectorSampleStride = steps
 	m.sectorSamples = make([]byte, sectors*steps)
+	// Sectors whose arc enters the dilated hard-feature zone get an exact
+	// per-byte rescan below.
+	zone := hardFeatureZone(image, m.alphaThreshold, samplingOuter, options.InnerRadiusMm)
+	candidate := make([]bool, sectors)
+	candidateCount := 0
+	cx := float64(image.width-1) / 2.0
+	cy := float64(image.height-1) / 2.0
 	for sector := 0; sector < sectors; sector++ {
 		row := m.sectorSamples[sector*steps : (sector+1)*steps]
 		arc0 := float64(sector) * m.sectorArcMm
@@ -92,13 +110,106 @@ func buildDisperseToneMap(image *rasterImage, options imageMappingOptions) (*dis
 			if sample.Alpha < m.alphaThreshold {
 				row[k] = 255 // unconstrained reads as white
 			}
+			px := int(cx + x*pxPerMm + 0.5)
+			py := int(cy - y*pxPerMm + 0.5)
+			if px >= 0 && py >= 0 && px < image.width && py < image.height && zone[py*image.width+px] {
+				if !candidate[sector] {
+					candidate[sector] = true
+					candidateCount++
+				}
+			}
 		}
 		slices.Sort(row)
 	}
+	m.tainted = m.exactByteTaint(image, candidate, candidateCount, samplingOuter)
 	if err := m.buildErosionGrid(); err != nil {
 		return nil, err
 	}
 	return m, nil
+}
+
+// hardFeatureZone returns the mask of pixels that can never become data tone
+// (luminance beyond the planner's widest gray band), dilated by 2 px so the
+// coarse arc walk detects every sector whose bytes may touch a feature.
+func hardFeatureZone(image *rasterImage, alphaThreshold byte, samplingOuter, innerRadiusMm float64) []bool {
+	width, height := image.width, image.height
+	cx := float64(width-1) / 2.0
+	cy := float64(height-1) / 2.0
+	scale := (float64(minInt(width, height)) - 1) / (2 * samplingOuter)
+	hard := make([]bool, width*height)
+	for py := 0; py < height; py++ {
+		yMm := (cy - float64(py)) / scale
+		for px := 0; px < width; px++ {
+			xMm := (float64(px) - cx) / scale
+			if r := math.Hypot(xMm, yMm); r < innerRadiusMm || r > samplingOuter {
+				continue // outside the drawn area: unconstrained, not a feature
+			}
+			o := (py*width + px) * 4
+			red, green, blue := float64(image.bgra[o+2]), float64(image.bgra[o+1]), float64(image.bgra[o+0])
+			lum := 0.2126*red + 0.7152*green + 0.0722*blue
+			if image.bgra[o+3] < alphaThreshold {
+				lum = 255 // unconstrained reads as white
+			}
+			if lum < hardFeatureLo || lum > hardFeatureHi {
+				hard[py*width+px] = true
+			}
+		}
+	}
+	// Dilate by 2 px (Chebyshev distance): two 3x3 passes.
+	dilate := func(in []bool) []bool {
+		out := make([]bool, width*height)
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				v := false
+				for dy := -1; dy <= 1 && !v; dy++ {
+					for dx := -1; dx <= 1; dx++ {
+						if x2, y2 := x+dx, y+dy; x2 >= 0 && y2 >= 0 && x2 < width && y2 < height && in[y2*width+x2] {
+							v = true
+							break
+						}
+					}
+				}
+				out[y*width+x] = v
+			}
+		}
+		return out
+	}
+	return dilate(dilate(hard))
+}
+
+// exactByteTaint rescans candidate sectors at the writer's own per-byte
+// sample positions and marks those whose bytes land on a hard-feature pixel.
+// Arc sampling at any density can miss such grazes (measured: 128 leaked
+// sectors on the Debian cover with 2x-pixel-rate arc sampling).
+func (m *disperseToneMap) exactByteTaint(image *rasterImage, candidate []bool, candidateCount int, samplingOuter float64) []bool {
+	tainted := make([]bool, int(m.options.TotalSectors))
+	if candidateCount == 0 {
+		return tainted
+	}
+	bitLengthMm := m.options.ChannelBitLengthNm * 1e-6
+	for sector := range candidate {
+		if !candidate[sector] {
+			continue
+		}
+		base := uint64(sector&^15) * dvdChannelBitsPerSector
+		off := (sector & 15) * dvdPayloadBytesPerSector
+		for i := 0; i < dvdPayloadBytesPerSector; i++ {
+			globalBit := base + uint64(payloadChannelCenters[off+i])
+			radius, trackAngle := m.spiral.atArcLengthFast(float64(globalBit) * bitLengthMm)
+			x := radius * math.Cos(-trackAngle)
+			y := radius * math.Sin(-trackAngle)
+			sample := image.sampleDisc(x, y, samplingOuter, true)
+			lum := sample.Luminance
+			if sample.Alpha < m.alphaThreshold {
+				lum = 255
+			}
+			if lum < hardFeatureLo || lum > hardFeatureHi {
+				tainted[sector] = true
+				break
+			}
+		}
+	}
+	return tainted
 }
 
 // buildErosionGrid samples the source image on a polar grid aligned to the
@@ -133,8 +244,7 @@ func (m *disperseToneMap) buildErosionGrid() error {
 		for a := 0; a < erosionArcBins; a++ {
 			// Cell center angle within the turn.
 			angle := angle0 + (float64(a)+0.5)*(2*math.Pi)/erosionArcBins
-			// Cell center angle within the turn is converted with the
-			// writer's mapping (CW, start angle 0), same as the arcs.
+			// The writer's mapping (CW, start angle 0), same as the arcs.
 			x := r * math.Cos(-angle)
 			y := r * math.Sin(-angle)
 			sample := m.image.sampleDisc(x, y, samplingOuter, true)
@@ -295,8 +405,9 @@ func (m *disperseToneMap) classifySectors(t1, t2 byte, marginWhiteMm, marginBlac
 		total := gray + white + black
 		// A single off-band sample means the sector's arc grazes a picture
 		// feature: protect it. (Tolerating even 1 in N samples visibly
-		// frays thin strokes.)
-		if gray == total {
+		// frays thin strokes.) Tainted sectors (a rendered byte lands on a
+		// hard feature) never hold data either.
+		if gray == total && !m.tainted[sector] {
 			eligible[sector] = true
 			continue
 		}

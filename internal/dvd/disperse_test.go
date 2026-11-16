@@ -761,6 +761,7 @@ func fakeDisperseToneMap(t *testing.T, total int, sectorPattern func(sector int)
 		gridArcs:           erosionArcBins,
 		turnRadii:          []float64{25},
 		gridLum:            make([]byte, erosionArcBins),
+		tainted:            make([]bool, total),
 	}
 }
 

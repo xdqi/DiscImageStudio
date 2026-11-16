@@ -161,7 +161,7 @@ func planDispersion(in dispersePlannerInputs) (*dispersePlan, error) {
 			}
 		}
 		// Capacity loop: widen the band, then shrink the margins.
-		if band[0] > 64 || band[1] < 192 {
+		if band[0] > hardFeatureLo || band[1] < hardFeatureHi {
 			band[0] -= 2
 			band[1] += 2
 			continue
