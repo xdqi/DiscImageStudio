@@ -68,11 +68,12 @@ func buildDisperseToneMap(image *rasterImage, options imageMappingOptions) (*dis
 
 	sectors := int(options.TotalSectors)
 	samplingOuter := options.samplingOuterRadiusMm()
-	// Sample every image pixel along each sector's arc (a sector's arc spans
-	// ~46 px here): thin picture features (text strokes, outlines) must not
-	// slip between samples and turn a sector into "pure background".
+	// Sample along each sector's arc at twice the image-pixel rate (Nyquist):
+	// a 1-px stroke crossed at any angle occupies >= 1 px of arc length and
+	// must always catch a sample — a sparser walk lets data sectors slip onto
+	// thin picture features (measured: 262 leaked sectors at ~1 px spacing).
 	pxPerMm := (float64(minInt(image.width, image.height)) - 1) / (2 * samplingOuter)
-	steps := int(math.Ceil(m.sectorArcMm*pxPerMm)) + 1
+	steps := int(math.Ceil(2*m.sectorArcMm*pxPerMm)) + 1
 	m.sectorSampleStride = steps
 	m.sectorSamples = make([]byte, sectors*steps)
 	for sector := 0; sector < sectors; sector++ {
@@ -81,12 +82,12 @@ func buildDisperseToneMap(image *rasterImage, options imageMappingOptions) (*dis
 		for k := 0; k < steps; k++ {
 			arcMm := arc0 + float64(k)*m.sectorArcMm/float64(steps)
 			radius, trackAngle := spiral.atArcLengthFast(arcMm)
-			polarAngle := -trackAngle // clockwise, like the writer
+			// The same mapping the writer uses (CW, start angle 0):
+			// sampleDisc's y-down flip turns math y-up into image rows.
+			polarAngle := -trackAngle
 			x := radius * math.Cos(polarAngle)
 			y := radius * math.Sin(polarAngle)
-			// Image y-down vs physical y-up (the engine flips; a tone map is
-			// mirror-invariant for luminance, but keep the exact mapping).
-			sample := image.sampleDisc(x, -y, samplingOuter, true)
+			sample := image.sampleDisc(x, y, samplingOuter, true)
 			row[k] = sample.Luminance
 			if sample.Alpha < m.alphaThreshold {
 				row[k] = 255 // unconstrained reads as white
@@ -132,9 +133,11 @@ func (m *disperseToneMap) buildErosionGrid() error {
 		for a := 0; a < erosionArcBins; a++ {
 			// Cell center angle within the turn.
 			angle := angle0 + (float64(a)+0.5)*(2*math.Pi)/erosionArcBins
+			// Cell center angle within the turn is converted with the
+			// writer's mapping (CW, start angle 0), same as the arcs.
 			x := r * math.Cos(-angle)
 			y := r * math.Sin(-angle)
-			sample := m.image.sampleDisc(x, -y, samplingOuter, true)
+			sample := m.image.sampleDisc(x, y, samplingOuter, true)
 			lum := sample.Luminance
 			if sample.Alpha < m.alphaThreshold {
 				lum = 255
@@ -290,7 +293,10 @@ func (m *disperseToneMap) classifySectors(t1, t2 byte, marginWhiteMm, marginBlac
 	for sector := 0; sector < sectors; sector++ {
 		gray, white, black := m.sectorToneStats(t1, t2, sector)
 		total := gray + white + black
-		if gray*100 >= 98*total {
+		// A single off-band sample means the sector's arc grazes a picture
+		// feature: protect it. (Tolerating even 1 in N samples visibly
+		// frays thin strokes.)
+		if gray == total {
 			eligible[sector] = true
 			continue
 		}

@@ -3,6 +3,7 @@ package dvd
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -673,6 +674,63 @@ func TestPlaceDispersionTooManyExtents(t *testing.T) {
 	}
 	if tooMany.path != "big.bin" || tooMany.extents != 301 {
 		t.Fatalf("tooManyExtentsError = %q/%d, want big.bin/301", tooMany.path, tooMany.extents)
+	}
+}
+
+// TestToneMapMatchesWriterGeometry: a landmark feature must be protected at
+// the position the WRITER renders it, not at a mirrored/rotated position.
+// (Regression: the tone map once sampled sampleDisc(x, -y), mirroring the
+// picture around the horizontal axis — protection landed on the mirror image
+// and data fell on the asymmetric features, e.g. the Debian logo's text.)
+func TestToneMapMatchesWriterGeometry(t *testing.T) {
+	// 64x64 gray image with a white square at x[45,48), y[26,29) (right of
+	// center, ABOVE the horizontal axis; its mirror is below).
+	const size = 64
+	img := rasterImageCreateForTest(size, size, 130, 130, 130, 255)
+	for y := 26; y < 29; y++ {
+		for x := 45; x < 48; x++ {
+			o := (y*size + x) * 4
+			img.bgra[o+0], img.bgra[o+1], img.bgra[o+2] = 255, 255, 255
+		}
+	}
+	img.hasBinaryGrayscalePalette = false // force the plain sampling path
+	opts := imageMappingOptions{
+		TotalSectors: 393216, InnerRadiusMm: 24, OuterRadiusMm: 58, ChannelBitLengthNm: 133.3,
+	}
+	tm, err := buildDisperseToneMap(img, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eligible := tm.classifySectors(120, 136, 0, 0)
+
+	scale := float64(size-1) / (2 * opts.samplingOuterRadiusMm())
+	inSquare := func(px, py float64) bool { return px >= 44 && px < 49 && py >= 25 && py < 30 }
+	inMirror := func(px, py float64) bool { return px >= 44 && px < 49 && py >= 34 && py < 39 }
+	var protSquare, protMirror int
+	for s := 0; s < int(opts.TotalSectors); s++ {
+		if eligible[s] {
+			continue
+		}
+		// The writer's pixel position of this sector's arc midpoint
+		// (CW direction, start angle 0).
+		arcMm := (float64(s) + 0.5) * tm.sectorArcMm
+		radius, trackAngle := tm.spiral.atArcLengthFast(arcMm)
+		x := radius * math.Cos(-trackAngle)
+		y := radius * math.Sin(-trackAngle)
+		wpx := float64(size-1)/2 + x*scale
+		wpy := float64(size-1)/2 - y*scale
+		switch {
+		case inSquare(wpx, wpy):
+			protSquare++
+		case inMirror(wpx, wpy):
+			protMirror++
+		}
+	}
+	if protMirror > 0 {
+		t.Fatalf("tone map is mirrored: %d protected sectors map to the landmark's mirror position", protMirror)
+	}
+	if protSquare == 0 {
+		t.Fatal("no protected sector over the landmark")
 	}
 }
 
