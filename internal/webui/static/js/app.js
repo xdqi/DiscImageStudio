@@ -155,6 +155,11 @@ async function importPhoto(file) {
   state.rectified = null;
   state.outerPoints = [];
   state.holePoints = [];
+  // A new photo starts a new measurement session.
+  state.coarseEdges = [null, null, null, null, null, null];
+  state.boundarySegments = [];
+  state.boundaryCurrent = null;
+  state.fineTrace = [];
   $("measure-panel").classList.add("hidden");
   if (!photoCanvas) photoCanvas = new ImageCanvas($("photo-canvas"), state.photo.canvas);
   else photoCanvas.setImage(state.photo.canvas, false);
@@ -265,7 +270,8 @@ function setupMeasurement() {
     const rangeLabel = document.createElement("label");
     rangeLabel.innerHTML = 'Search ±mm <input id="fit-range" type="number" step="0.005" value="0.01" min="0.001" max="0.05">';
     buttons.append(newSegment, solve, rangeLabel);
-    state.boundarySegments = [];
+    // Keep state.boundarySegments (session restore / stage switch); new
+    // clicks must not append to a loaded segment.
     state.boundaryCurrent = null;
     setupBoundaryCanvas();
   } else {
@@ -277,7 +283,7 @@ function setupMeasurement() {
     const rangeLabel = document.createElement("label");
     rangeLabel.innerHTML = 'Search ±mm <input id="fit-range" type="number" step="0.01" value="0.02" min="0.001" max="5">';
     buttons.append(solve, pitchLabel, rangeLabel);
-    state.fineTrace = [];
+    // state.fineTrace is kept (session restore / stage switch).
     setupFineCanvas(target);
   }
 }
@@ -294,12 +300,15 @@ function makeButton(text, onClick, cls = "") {
 // -- coarse --
 
 function setupCoarseCanvas() {
-  let nextEdge = 0;
+  // Restore edges already marked (session load / stage switch): the filled
+  // slots of state.coarseEdges form a prefix, so they resume in order.
+  const restored = state.coarseEdges.filter((p) => p != null);
+  let nextEdge = restored.length;
   rectCanvas.pointSets = [{
-    points: [],
+    points: restored.map((p) => ({ x: p.x, y: p.y })),
     color: "#67e0b8",
     world: true,
-    labels: [],
+    labels: restored.map((_, i) => COARSE_EDGE_NAMES[i]),
   }];
   const set = rectCanvas.pointSets[0];
   rectCanvas.onClick = (world) => {
@@ -445,7 +454,13 @@ function runBoundaryFit() {
 // -- fine --
 
 function setupFineCanvas(target) {
-  rectCanvas.pointSets = [{ points: state.fineTrace, color: "#67e0b8", world: true, labels: [] }];
+  // state.fineTrace keeps any restored trace; number the points.
+  rectCanvas.pointSets = [{
+    points: state.fineTrace,
+    color: "#67e0b8",
+    world: true,
+    labels: state.fineTrace.map((_, i) => String(i + 1)),
+  }];
   rectCanvas.onClick = (world) => {
     state.fineTrace.push({ x: world.x, y: world.y });
     rectCanvas.pointSets[0].labels = state.fineTrace.map((_, i) => String(i + 1));

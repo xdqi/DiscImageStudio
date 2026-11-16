@@ -44,7 +44,7 @@ async function settleIdle() {
 
 // A <canvas>-element mock with a recording 2D context.
 function makeCanvas(cssWidth) {
-  const calls = { drawImage: [], moveTo: 0, lineTo: 0, arc: 0, fillRect: 0 };
+  const calls = { drawImage: [], moveTo: 0, lineTo: 0, arc: 0, fillRect: 0, fillText: [] };
   const el = {
     cssWidth,
     _width: 300,
@@ -71,7 +71,8 @@ function makeCanvas(cssWidth) {
     moveTo() { calls.moveTo++; },
     lineTo() { calls.lineTo++; },
     arc() { calls.arc++; },
-    fillText() {}, setLineDash() {},
+    fillText(text) { calls.fillText.push(String(text)); },
+    setLineDash() {},
     save() {}, restore() {}, translate() {}, scale() {},
     getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(w * h * 4), width: w, height: h }; },
     createImageData(w, h) { return { data: new Uint8ClampedArray(w * h * 4), width: w, height: h }; },
@@ -241,6 +242,105 @@ test("rectification overlays the computed disc outline on the photo", async () =
   flushFrames();
   assert.equal(photoEl.ctx.calls.moveTo, 0, "no outline after Clear");
   assert.equal(photoEl.ctx.calls.arc, 0, "no markers after Clear");
+});
+
+test("loading a session restores the measurement points", async () => {
+  installGlobals();
+  const elements = new Map();
+  globalThis.document = {
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, makeElement(id));
+      return elements.get(id);
+    },
+    createElement: (tag) => (tag === "canvas" ? makeCanvas(800) : makeElement(tag)),
+    querySelectorAll: () => [],
+  };
+  Object.defineProperty(globalThis, "navigator", {
+    value: { clipboard: { writeText: async () => {} } },
+    configurable: true,
+  });
+  // Photo.fromDataUrl needs an Image; resolve immediately with a 400×300 frame.
+  globalThis.Image = class {
+    set src(_url) {
+      this.naturalWidth = 400;
+      this.naturalHeight = 300;
+      queueMicrotask(() => this.onload());
+    }
+  };
+  for (const [id, value] of Object.entries({
+    kind: "dvd", stage: "coarse", "p-r0": "24", "p-r1": "58", "p-sectors": "2297888",
+    "p-density": "133.3", "p-c1": "0", "p-c2": "0", "p-c3": "0", "p-usable": "",
+    "disc-size": "60",
+  })) {
+    document.getElementById(id).value = value;
+  }
+  await import(JS + "app.js?session-restore"); // fresh module instance
+
+  const baseSession = {
+    format: "disc-image-studio-web-calibration-v1",
+    stage: "coarse",
+    parameters: {
+      kind: "dvd", innerRadiusMm: 24, outerRadiusMm: 58, sectors: 2297888,
+      linearDensity: 133.3, pitchLinear: 0, pitchQuadratic: 0, pitchCubic: 0, usableSectors: 0,
+    },
+    physicalOuterRadiusMm: 60,
+    outerPoints: [],
+    holePoints: [],
+    // 2 px/mm, disc centre at (200,150): discToSource homography.
+    transform9: [2, 0, 200, 0, 2, 150, 0, 0, 1],
+    coarseEdges: [{ x: 30, y: 0 }, { x: -30, y: 0 }, null, null, null, null],
+    boundarySegments: [],
+    fineTrace: [],
+    photoPng: "data:image/png;base64,AAAA",
+  };
+  const rectEl = document.getElementById("rectified-canvas");
+  const load = async (session) => {
+    const file = { text: async () => JSON.stringify(session) };
+    document.getElementById("load-session").fire("change", { target: { files: [file] } });
+    await new Promise((resolve) => setTimeout(resolve, 0)); // let loadSession finish
+    flushFrames();
+  };
+  const reset = () => {
+    rectEl.ctx.calls.arc = 0;
+    rectEl.ctx.calls.moveTo = 0;
+    rectEl.ctx.calls.lineTo = 0;
+    rectEl.ctx.calls.fillText.length = 0;
+  };
+
+  // Coarse stage: two restored edges are drawn with their names, and the
+  // next click continues the sequence instead of restarting it.
+  await load(baseSession);
+  assert.equal(rectEl.ctx.calls.arc, 2, "restored coarse edges drawn");
+  assert.deepEqual(rectEl.ctx.calls.fillText, ["band 1 inner", "band 1 outer"]);
+  reset(); // the counters accumulate across frames
+  rectEl.fire("pointerdown", { button: 0, clientX: 400, clientY: 100, preventDefault() {} });
+  flushFrames();
+  assert.equal(rectEl.ctx.calls.arc, 3, "the click adds a third edge");
+  assert.ok(rectEl.ctx.calls.fillText.includes("band 2 inner"),
+    `the third edge continues the sequence: ${rectEl.ctx.calls.fillText}`);
+
+  // Boundary stage: the restored segment's markers and polyline are drawn.
+  reset();
+  await load({
+    ...baseSession,
+    stage: "boundary",
+    coarseEdges: [null, null, null, null, null, null],
+    boundarySegments: [{ id: 0, points: [{ x: 30, y: 0 }, { x: 35, y: 5 }, { x: 40, y: 10 }, { x: 45, y: 15 }] }],
+  });
+  assert.equal(rectEl.ctx.calls.arc, 4, "restored boundary points drawn");
+  assert.equal(rectEl.ctx.calls.lineTo, 3, "restored boundary polyline drawn");
+  assert.equal(rectEl.ctx.calls.moveTo, 1, "one polyline");
+
+  // Fine stage: the restored trace is drawn with numbered labels.
+  reset();
+  await load({
+    ...baseSession,
+    stage: "fine",
+    boundarySegments: [],
+    fineTrace: [{ x: 25, y: 0 }, { x: 30, y: 1 }, { x: 35, y: 2 }, { x: 40, y: 3 }, { x: 45, y: 4 }, { x: 50, y: 5 }],
+  });
+  assert.equal(rectEl.ctx.calls.arc, 6, "restored trace points drawn");
+  assert.deepEqual(rectEl.ctx.calls.fillText, ["1", "2", "3", "4", "5", "6"], "trace labels");
 });
 
 test("Clear empties the rectification points; re-import keeps single handlers", async () => {
