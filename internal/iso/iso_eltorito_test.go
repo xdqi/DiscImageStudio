@@ -2,6 +2,7 @@ package iso
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,14 +11,14 @@ import (
 )
 
 // newTestBridge builds the layer used by the El Torito tests: a small volume
-// with a 4 KiB boot image planned at LBA 300.
+// with a 4 KiB boot image planned at LBA 300 and nothing exposed.
 func newTestBridge(t *testing.T) *ElToritoBridge {
 	t.Helper()
-	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096)
+	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bridge.SetBootImageLba(300); err != nil {
+	if err := bridge.SetPlacements(300, nil); err != nil {
 		t.Fatal(err)
 	}
 	return bridge
@@ -54,8 +55,8 @@ func TestElToritoBridgeDescriptors(t *testing.T) {
 	if got := string(pvd[40:72]); got != "TEST                            " {
 		t.Fatalf("PVD volume id = %q", got)
 	}
-	if got := binary.LittleEndian.Uint32(pvd[132:136]); got != bridgePathTableBytes {
-		t.Fatalf("PVD path table size = %d, want %d", got, bridgePathTableBytes)
+	if got := binary.LittleEndian.Uint32(pvd[132:136]); got != uint32(bridge.pathTableBytes) {
+		t.Fatalf("PVD path table size = %d, want %d", got, bridge.pathTableBytes)
 	}
 	if got := binary.LittleEndian.Uint32(pvd[140:144]); got != 22 {
 		t.Fatalf("PVD little-endian path table LBA = %d, want 22", got)
@@ -204,32 +205,32 @@ func TestElToritoBridgeAccessors(t *testing.T) {
 }
 
 func TestElToritoBridgeValidation(t *testing.T) {
-	if _, err := NewElToritoBridge(25, "TEST", "boot.img", 4096); err == nil {
+	if _, err := NewElToritoBridge(25, "TEST", "boot.img", 4096, nil, nil); err == nil {
 		t.Fatal("volumeSectors 25: want error")
 	}
-	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 0); err == nil {
+	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 0, nil, nil); err == nil {
 		t.Fatal("bootImageSize 0: want error")
 	}
-	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", maxBootImageBytes+1); err == nil {
+	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", maxBootImageBytes+1, nil, nil); err == nil {
 		t.Fatal("bootImageSize > 8 GiB: want error")
 	}
-	if _, err := NewElToritoBridge(4096, "TEST", "...", 4096); err == nil {
+	if _, err := NewElToritoBridge(4096, "TEST", "...", 4096, nil, nil); err == nil {
 		t.Fatal("boot image name normalizing to empty: want error")
 	}
 
-	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096)
+	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := bridge.SectorContent(16); err == nil {
-		t.Fatal("SectorContent before SetBootImageLba: want error")
+		t.Fatal("SectorContent before SetPlacements: want error")
 	}
 	for _, lba := range []uint32{0, 24, 4096, 5000} {
-		if err := bridge.SetBootImageLba(lba); err == nil {
-			t.Fatalf("SetBootImageLba(%d): want error", lba)
+		if err := bridge.SetPlacements(lba, nil); err == nil {
+			t.Fatalf("SetPlacements(%d): want error", lba)
 		}
 	}
-	if err := bridge.SetBootImageLba(300); err != nil {
+	if err := bridge.SetPlacements(300, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -274,5 +275,139 @@ func TestElToritoBridgeXorriso(t *testing.T) {
 		!strings.Contains(bootLine, " 8 ") ||
 		!strings.Contains(bootLine, " 300") {
 		t.Fatalf("xorriso did not report the no-emulation boot entry at LBA 300:\n%s", text)
+	}
+}
+
+// TestElToritoBridgeExposedTree exposes /a/bar and /a/b/barz: the ISO9660
+// side gets a directory /A holding BAR;1 and a subdirectory B holding BARZ;1.
+func TestElToritoBridgeExposedTree(t *testing.T) {
+	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096,
+		[]ExposedFile{{Path: "a/bar", Size: 100}, {Path: "a/b/barz", Size: 200}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Layout: path table @22 (3 entries × 10 bytes → 1 sector), then the
+	// directory extents in path-table order (root@23, A@24, B@25), catalog@26.
+	if bridge.catalogLba != 26 {
+		t.Fatalf("catalog LBA = %d, want 26", bridge.catalogLba)
+	}
+	if err := bridge.SetPlacements(300, []uint32{400, 500}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Path table: (root, A, B) with parents (1, 1, 2) and extents (23, 24, 25).
+	pt := mustBridgeSector(t, bridge, 22)
+	type ptEntry struct {
+		lba, parent uint32
+		id          byte
+	}
+	want := []ptEntry{{23, 1, 0}, {24, 1, 'A'}, {25, 2, 'B'}}
+	for i, w := range want {
+		off := i * 10
+		got := ptEntry{binary.LittleEndian.Uint32(pt[off+2:]), uint32(binary.LittleEndian.Uint16(pt[off+6:])), pt[off+8]}
+		if pt[off] != 1 || pt[off+1] != 0 || got != w {
+			t.Fatalf("path table entry %d = len %d lba %d parent %d id %q, want %+v", i, pt[off], got.lba, got.parent, got.id, w)
+		}
+	}
+
+	root := parseDirRecords(t, mustBridgeSector(t, bridge, 23))
+	wantRoot := []parsedDirRecord{
+		{lba: 23, size: LogicalSectorBytes, flags: 2, id: "\x00"},
+		{lba: 23, size: LogicalSectorBytes, flags: 2, id: "\x01"},
+		{lba: 26, size: LogicalSectorBytes, flags: 0, id: "BOOT.CAT;1"},
+		{lba: 300, size: 4096, flags: 0, id: "BOOT.IMG;1"},
+		{lba: 24, size: LogicalSectorBytes, flags: 2, id: "A"},
+	}
+	if len(root) != len(wantRoot) {
+		t.Fatalf("root records = %+v", root)
+	}
+	for i, w := range wantRoot {
+		if root[i] != w {
+			t.Fatalf("root record %d = %+v, want %+v", i, root[i], w)
+		}
+	}
+
+	dirA := parseDirRecords(t, mustBridgeSector(t, bridge, 24))
+	wantA := []parsedDirRecord{
+		{lba: 24, size: LogicalSectorBytes, flags: 2, id: "\x00"},
+		{lba: 23, size: LogicalSectorBytes, flags: 2, id: "\x01"},
+		{lba: 400, size: 100, flags: 0, id: "BAR;1"},
+		{lba: 25, size: LogicalSectorBytes, flags: 2, id: "B"},
+	}
+	if len(dirA) != len(wantA) {
+		t.Fatalf("/A records = %+v", dirA)
+	}
+	for i, w := range wantA {
+		if dirA[i] != w {
+			t.Fatalf("/A record %d = %+v, want %+v", i, dirA[i], w)
+		}
+	}
+
+	dirB := parseDirRecords(t, mustBridgeSector(t, bridge, 25))
+	wantB := []parsedDirRecord{
+		{lba: 25, size: LogicalSectorBytes, flags: 2, id: "\x00"},
+		{lba: 24, size: LogicalSectorBytes, flags: 2, id: "\x01"},
+		{lba: 500, size: 200, flags: 0, id: "BARZ;1"},
+	}
+	if len(dirB) != len(wantB) {
+		t.Fatalf("/A/B records = %+v", dirB)
+	}
+	for i, w := range wantB {
+		if dirB[i] != w {
+			t.Fatalf("/A/B record %d = %+v, want %+v", i, dirB[i], w)
+		}
+	}
+
+	// The metadata extent list covers exactly the bridge sectors.
+	var lbas []uint32
+	for _, extent := range bridge.MetadataExtents() {
+		lbas = append(lbas, extent.Lba)
+	}
+	wantLbas := []uint32{16, 17, 18, 22, 23, 24, 25, 26}
+	if len(lbas) != len(wantLbas) {
+		t.Fatalf("MetadataExtents LBAs = %v", lbas)
+	}
+	for i := range wantLbas {
+		if lbas[i] != wantLbas[i] {
+			t.Fatalf("MetadataExtents[%d] = %d, want %d (all: %v)", i, lbas[i], wantLbas[i], lbas)
+		}
+	}
+}
+
+// TestElToritoBridgeExposedValidation: bad paths, empty files and oversized
+// trees are rejected.
+func TestElToritoBridgeExposedValidation(t *testing.T) {
+	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096,
+		[]ExposedFile{{Path: "a/../b", Size: 1}}, nil); err == nil {
+		t.Fatal("path with '..': want error")
+	}
+	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096,
+		[]ExposedFile{{Path: "", Size: 1}}, nil); err == nil {
+		t.Fatal("empty path: want error")
+	}
+	// An empty exposed file is allowed; its record carries extent LBA 0.
+	bridge, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096,
+		[]ExposedFile{{Path: "empty.bin", Size: 0}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.SetPlacements(300, []uint32{0}); err != nil {
+		t.Fatal(err)
+	}
+	records := parseDirRecords(t, mustBridgeSector(t, bridge, 23))
+	last := records[len(records)-1]
+	if last.id != "EMPTY.BIN;1" || last.lba != 0 || last.size != 0 {
+		t.Fatalf("empty file record = %+v", last)
+	}
+	if err := bridge.SetPlacements(300, []uint32{400}); err == nil {
+		t.Fatal("nonzero LBA for an empty file: want error")
+	}
+	// Too many directories: the tree must end before the anchor at 256.
+	var many []ExposedFile
+	for i := 0; i < 250; i++ {
+		many = append(many, ExposedFile{Path: fmt.Sprintf("d%03d/f", i), Size: 1})
+	}
+	if _, err := NewElToritoBridge(4096, "TEST", "boot.img", 4096, many, nil); err == nil {
+		t.Fatal("250 directories: want error (anchor at 256)")
 	}
 }

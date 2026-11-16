@@ -42,6 +42,10 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	} else if arguments.Has("boot-image") {
 		return newArgumentError("--boot-image requires --filesystem udf-bridge.")
 	}
+	exposePaths := arguments.GetAll("expose")
+	if len(exposePaths) > 0 && !bridge {
+		return newArgumentError("--expose requires --filesystem udf-bridge.")
+	}
 	volumeLabel := arguments.Get("volume-label", "DVD_IMAGE")
 
 	imageMapping, err := readImageMappingOptions(arguments, 1)
@@ -96,19 +100,51 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		return err
 	}
 	bootImageIndex := -1
+	var exposed []iso.ExposedFile
+	var exposedIndexes []int
+	var extraDirs []string
 	if bridge {
 		index, found := udfPlan.FindFile(bootImagePath)
 		if !found {
 			return newArgumentError(fmt.Sprintf("--boot-image must name a regular file inside the data directory (path relative to the image root): %s", bootImagePath))
 		}
 		bootImageIndex = index
+		// --expose: a regular file, or a directory expanded recursively.
+		// Overlapping exposures are deduplicated by file index.
+		seen := map[int]bool{}
+		for _, raw := range exposePaths {
+			files, dirs, ok := udfPlan.WalkExposure(strings.ReplaceAll(raw, "\\", "/"))
+			if !ok {
+				return newArgumentError(fmt.Sprintf("--expose must name a regular file or directory inside the data directory (path relative to the image root): %s", raw))
+			}
+			extraDirs = append(extraDirs, dirs...)
+			for _, file := range files {
+				if seen[file.Index] {
+					continue
+				}
+				seen[file.Index] = true
+				exposed = append(exposed, iso.ExposedFile{Path: file.Path, Size: udfPlan.FileSize(file.Index)})
+				exposedIndexes = append(exposedIndexes, file.Index)
+			}
+		}
+	}
+
+	// The El Torito / ISO9660 layer (bridge only) is built before planning:
+	// its tree fixes the metadata sectors to reserve.
+	metaEnd := udfPlan.MetaEndLbaExclusive()
+	totalSectors := imageMapping.TotalSectors
+	var bridgeLayer *iso.ElToritoBridge
+	if bridge {
+		bridgeLayer, err = iso.NewElToritoBridge(totalSectors, volumeLabel,
+			udfPlan.FileName(bootImageIndex), udfPlan.FileSize(bootImageIndex), exposed, extraDirs)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Fixed constraints: the filesystem metadata that cannot move. The whole
 	// metadata region [0, metaEnd) and the reserve tail [N-257, N) are excluded
 	// from placement via the reserved ranges; this list is the sidecar report.
-	metaEnd := udfPlan.MetaEndLbaExclusive()
-	totalSectors := imageMapping.TotalSectors
 	u32 := func(v uint32) *uint32 { return &v }
 	fixed := []isoConstraint{
 		{role: "udf-vrs", length: 3, fixedAt: u32(vrsStart)},
@@ -121,18 +157,13 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		{role: "udf-anchor", length: 1, fixedAt: u32(totalSectors - 1)},
 	}
 	if bridge {
-		fixed = append(fixed,
-			isoConstraint{role: "iso9660-pvd", length: 1, fixedAt: u32(16)},
-			isoConstraint{role: "el-torito-record", length: 1, fixedAt: u32(17)},
-			isoConstraint{role: "iso9660-terminator", length: 1, fixedAt: u32(18)},
-			isoConstraint{role: "iso9660-pathtable", length: 1, fixedAt: u32(22)},
-			isoConstraint{role: "iso9660-rootdir", length: 1, fixedAt: u32(23)},
-			isoConstraint{role: "boot-catalog", length: 1, fixedAt: u32(24)},
-		)
+		for _, extent := range bridgeLayer.MetadataExtents() {
+			fixed = append(fixed, isoConstraint{role: extent.Role, length: 1, fixedAt: u32(extent.Lba)})
+		}
 	}
 
-	// Planner: the boot image is a continuous demand linked to its tree file;
-	// everything else is aggregate file data.
+	// Planner: the boot image and every exposed file are continuous demands
+	// linked to their tree files; everything else is aggregate file data.
 	var continuous []continuousDemand
 	if bridge {
 		bootSectors := uint32((udfPlan.FileSize(bootImageIndex) + 2047) / 2048)
@@ -140,6 +171,16 @@ func solveDispersedUdf(arguments *cliArguments) error {
 			Role: "boot-image", Path: filepath.ToSlash(bootImagePath), Sectors: bootSectors,
 			FileIndex: bootImageIndex,
 		})
+		for i := range exposed {
+			if exposed[i].Size == 0 {
+				continue // an empty file has no extent (ISO9660 record LBA 0)
+			}
+			continuous = append(continuous, continuousDemand{
+				Role: "iso-expose", Path: exposed[i].Path,
+				Sectors:   uint32((exposed[i].Size + 2047) / 2048),
+				FileIndex: exposedIndexes[i],
+			})
+		}
 	}
 	fileCount := udfPlan.FileCount()
 	fileSizes := make([]int64, fileCount)
@@ -180,21 +221,26 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		return err
 	}
 
-	// The El Torito / ISO9660 layer (bridge only).
-	var bridgeLayer *iso.ElToritoBridge
+	// The El Torito / ISO9660 layer gets the planner-assigned LBAs.
 	if bridge {
-		bridgeLayer, err = iso.NewElToritoBridge(totalSectors, volumeLabel, udfPlan.FileName(bootImageIndex), udfPlan.FileSize(bootImageIndex))
-		if err != nil {
-			return err
-		}
-		// The boot image's LBA from the plan.
 		var bootLba uint32
+		byRole := map[string]uint32{}
 		for _, p := range plan.placed {
-			if p.Role == "boot-image" {
-				bootLba = p.Lba
-			}
+			byRole[p.Role+"/"+p.Path] = p.Lba
 		}
-		if err := bridgeLayer.SetBootImageLba(bootLba); err != nil {
+		bootLba = byRole["boot-image/"+filepath.ToSlash(bootImagePath)]
+		exposedLbas := make([]uint32, len(exposed))
+		for i := range exposed {
+			if exposed[i].Size == 0 {
+				continue // empty file: no extent (ISO9660 record LBA 0)
+			}
+			lba, ok := byRole["iso-expose/"+exposed[i].Path]
+			if !ok {
+				return fmt.Errorf("internal: no placement for exposed file %s", exposed[i].Path)
+			}
+			exposedLbas[i] = lba
+		}
+		if err := bridgeLayer.SetPlacements(bootLba, exposedLbas); err != nil {
 			return err
 		}
 	}

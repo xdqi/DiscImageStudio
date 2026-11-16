@@ -8,13 +8,21 @@ import (
 )
 
 // cliArguments ports CliArguments: --key value or --key=value options with
-// case-insensitive keys and duplicate rejection.
+// case-insensitive keys and duplicate rejection. Keys passed in
+// repeatableKeys may be given multiple times; retrieve all values with
+// GetAll (Get returns the first).
 type cliArguments struct {
 	values map[string]string
+	multi  map[string][]string
 }
 
-func parseCliArguments(arguments []string) (*cliArguments, error) {
+func parseCliArguments(arguments []string, repeatableKeys ...string) (*cliArguments, error) {
+	repeatable := make(map[string]bool, len(repeatableKeys))
+	for _, key := range repeatableKeys {
+		repeatable[strings.ToLower(key)] = true
+	}
 	values := make(map[string]string)
+	multi := make(map[string][]string)
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
 		if !strings.HasPrefix(argument, "--") {
@@ -33,12 +41,19 @@ func parseCliArguments(arguments []string) (*cliArguments, error) {
 			value = arguments[index]
 		}
 		lower := strings.ToLower(key) // OrdinalIgnoreCase
+		if repeatable[lower] {
+			if _, exists := values[lower]; !exists {
+				values[lower] = value
+			}
+			multi[lower] = append(multi[lower], value)
+			continue
+		}
 		if _, exists := values[lower]; exists {
 			return nil, newArgumentError("Option --" + key + " was specified more than once.")
 		}
 		values[lower] = value
 	}
-	return &cliArguments{values: values}, nil
+	return &cliArguments{values: values, multi: multi}, nil
 }
 
 func (a *cliArguments) Require(key string) (string, error) {
@@ -60,6 +75,11 @@ func (a *cliArguments) Get(key, fallback string) string {
 func (a *cliArguments) Has(key string) bool {
 	_, ok := a.values[strings.ToLower(key)]
 	return ok
+}
+
+// GetAll returns every value given for a repeatable option, in order.
+func (a *cliArguments) GetAll(key string) []string {
+	return a.multi[strings.ToLower(key)]
 }
 
 func (a *cliArguments) GetInt(key string, fallback int) (int, error) {

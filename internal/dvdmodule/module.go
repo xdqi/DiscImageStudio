@@ -55,6 +55,7 @@ var moduleDescriptor = core.DiscModuleDescriptor{
 				core.Opt("read-compatibility", "Experimental periodic 0x9B protection for fast dispersion", core.OptionBoolean, false, "false", ""),
 				core.Opt("filesystem", "Hybrid filesystem for --data-dir: iso (contiguous) or udf/udf-bridge (dispersed into the picture's gray areas)", core.OptionChoice, false, "iso", "", "iso", "udf", "udf-bridge"),
 				core.Opt("boot-image", "El Torito boot image: '/'-separated path of a file inside --data-dir, relative to the image root; placed contiguously and shared by the boot catalog and UDF (requires --filesystem udf-bridge)", core.OptionString, false, "", ""),
+				core.Opt("expose", "Expose a regular file (or a directory, recursively; symlinks are skipped) from --data-dir on the ISO9660 bridge at its image path, stored contiguously; repeatable (requires --filesystem udf-bridge)", core.OptionString, false, "", ""),
 				core.Opt("gray-band", "Gray-band luminance range T1:T2 for data sectors (default widens automatically from 120:136)", core.OptionString, false, "", ""),
 				core.Opt("interior-margin", "Border margin kept at original color inside large white areas", core.OptionDecimal, false, "0.35", "mm"),
 				core.Opt("interior-margin-black", "Border margin inside large black areas", core.OptionDecimal, false, "0.5", "mm"),

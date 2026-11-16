@@ -314,6 +314,167 @@ func TestDispersedUdfBridgeEndToEnd(t *testing.T) {
 	}
 }
 
+// parseIso9660DirRecords parses one ISO9660 directory extent's records.
+type iso9660TestRecord struct {
+	lba   uint32
+	size  uint32
+	flags byte
+	name  string
+}
+
+func parseIso9660DirRecords(t *testing.T, data []byte, lba, size uint32) []iso9660TestRecord {
+	t.Helper()
+	extent := data[int(lba)*2048 : int(lba)*2048+int(size)]
+	var records []iso9660TestRecord
+	for offset := 0; offset+2 <= len(extent) && extent[offset] != 0; {
+		length := int(extent[offset])
+		if length < 34 || offset+length > len(extent) {
+			t.Fatalf("bad record length %d at offset %d", length, offset)
+		}
+		record := extent[offset : offset+length]
+		idLen := int(record[32])
+		records = append(records, iso9660TestRecord{
+			lba:   binary.LittleEndian.Uint32(record[2:6]),
+			size:  binary.LittleEndian.Uint32(record[10:14]),
+			flags: record[25],
+			name:  string(record[33 : 33+idLen]),
+		})
+		offset += length
+	}
+	return records
+}
+
+// TestDispersedUdfBridgeExposeEndToEnd: --expose lists files on the ISO9660
+// side of the bridge at their image paths (parent directories synthesized),
+// each stored contiguously; exposing a directory expands it recursively.
+// The image contains /boot/loader.bin, /a/foo, /a/bar, /a/b/barz, /a/b/link.
+func TestDispersedUdfBridgeExposeEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	pngPath := writeGradientPng(t, filepath.Join(dir, "gradient.png"), 64)
+	dataDir := filepath.Join(dir, "data")
+	for name, content := range map[string][]byte{
+		"boot/loader.bin": bytes.Repeat([]byte{0x5A}, 4096),
+		"a/foo":           []byte("not exposed\n"),
+		"a/bar":          []byte("exposed bar\n"),
+		"a/b/barz":        bytes.Repeat([]byte{0x42}, 3000),
+	} {
+		path := filepath.Join(dataDir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("barz", filepath.Join(dataDir, "a", "b", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	isoPath := filepath.Join(dir, "disc.iso")
+	code := RunCommand([]string{
+		"solve", "--image", pngPath, "--iso-output", isoPath,
+		"--total-sectors", "4096", "--data-dir", dataDir,
+		"--filesystem", "udf-bridge", "--boot-image", "boot/loader.bin",
+		"--expose", "a/bar", "--expose=a/b",
+	})
+	if code != 0 {
+		t.Fatalf("solve exited %d", code)
+	}
+	data, err := os.ReadFile(isoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// UDF side: everything is present and round-trips.
+	v := newUdfTestVolume(t, data)
+	for name, want := range map[string][]byte{
+		"loader.bin": bytes.Repeat([]byte{0x5A}, 4096),
+		"foo":        []byte("not exposed\n"),
+		"bar":        []byte("exposed bar\n"),
+		"barz":       bytes.Repeat([]byte{0x42}, 3000),
+	} {
+		if got := readUdfFileByName(t, data, name); !bytes.Equal(got, want) {
+			t.Fatalf("UDF %s round-trip mismatch", name)
+		}
+	}
+
+	// The ISO9660 side: root has BOOT.CAT;1, LOADER.BIN;1 and directory A.
+	pvd := data[16*2048:]
+	rootLba := binary.LittleEndian.Uint32(pvd[158:162])
+	rootSize := binary.LittleEndian.Uint32(pvd[166:170])
+	root := parseIso9660DirRecords(t, data, rootLba, rootSize)
+	byName := map[string]iso9660TestRecord{}
+	for _, r := range root {
+		byName[r.name] = r
+	}
+	if _, ok := byName["BOOT.CAT;1"]; !ok {
+		t.Fatalf("root lacks BOOT.CAT;1: %v", root)
+	}
+	if _, ok := byName["LOADER.BIN;1"]; !ok {
+		t.Fatalf("root lacks LOADER.BIN;1: %v", root)
+	}
+	dirA, ok := byName["A"]
+	if !ok || dirA.flags&2 == 0 {
+		t.Fatalf("root lacks directory A: %v", root)
+	}
+
+	// /A holds BAR;1 (file, contiguous extent) and directory B; FOO is absent.
+	recsA := parseIso9660DirRecords(t, data, dirA.lba, dirA.size)
+	byNameA := map[string]iso9660TestRecord{}
+	for _, r := range recsA {
+		byNameA[r.name] = r
+	}
+	bar, ok := byNameA["BAR;1"]
+	if !ok || bar.flags&2 != 0 {
+		t.Fatalf("/A lacks BAR;1: %v", recsA)
+	}
+	if _, ok := byNameA["FOO;1"]; ok {
+		t.Fatal("/A must not contain FOO;1 (foo was not exposed)")
+	}
+	dirB, ok := byNameA["B"]
+	if !ok || dirB.flags&2 == 0 {
+		t.Fatalf("/A lacks directory B: %v", recsA)
+	}
+
+	// /A/B holds BARZ;1 (the directory --expose expanded) and no symlink.
+	recsB := parseIso9660DirRecords(t, data, dirB.lba, dirB.size)
+	byNameB := map[string]iso9660TestRecord{}
+	for _, r := range recsB {
+		byNameB[r.name] = r
+	}
+	barz, ok := byNameB["BARZ;1"]
+	if !ok {
+		t.Fatalf("/A/B lacks BARZ;1: %v", recsB)
+	}
+	if _, ok := byNameB["LINK;1"]; ok {
+		t.Fatal("the symlink in an exposed directory must be skipped")
+	}
+
+	// The ISO9660 record LBAs equal the files' UDF extents, each a single
+	// contiguous extent.
+	for name, record := range map[string]iso9660TestRecord{"bar": bar, "barz": barz} {
+		fe := v.findFileEntry(name)
+		if fe == nil {
+			t.Fatalf("%s not in the UDF tree", name)
+		}
+		if adLen := binary.LittleEndian.Uint32(fe[172:176]); adLen != 8 {
+			t.Fatalf("exposed %s has %d allocation-descriptor bytes, want 8 (one extent)", name, adLen)
+		}
+		extentLbn := binary.LittleEndian.Uint32(fe[180:184])
+		if v.partitionStart+uint64(extentLbn) != uint64(record.lba) {
+			t.Fatalf("%s: ISO9660 LBA %d != UDF extent LBA %d", name, record.lba, v.partitionStart+uint64(extentLbn))
+		}
+		if int64(record.size) != int64(len(map[string][]byte{"bar": []byte("exposed bar\n"), "barz": bytes.Repeat([]byte{0x42}, 3000)}[name])) {
+			t.Fatalf("%s: record size %d", name, record.size)
+		}
+		// Content at the shared extent matches.
+		start := int(record.lba) * 2048
+		if got := data[start : start+int(record.size)]; !bytes.Equal(got, map[string][]byte{"bar": []byte("exposed bar\n"), "barz": bytes.Repeat([]byte{0x42}, 3000)}[name]) {
+			t.Fatalf("%s: content at the shared extent mismatches", name)
+		}
+	}
+}
+
 // TestDispersedUdfBridgeBootImageErrors: --boot-image must resolve inside the
 // data directory.
 func TestDispersedUdfBridgeBootImageErrors(t *testing.T) {

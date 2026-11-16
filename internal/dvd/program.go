@@ -34,7 +34,7 @@ func runCommand(args []string) error {
 	var err error
 	switch strings.ToLower(args[0]) {
 	case "solve":
-		err = solveCommand(mustParseCli(args[1:]))
+		err = solveCommand(mustParseCli(args[1:], "expose"))
 	case "encode":
 		err = encodeCommand(mustParseCli(args[1:]))
 	case "calibrate":
@@ -49,8 +49,8 @@ func runCommand(args []string) error {
 	return err
 }
 
-func mustParseCli(args []string) *cliArguments {
-	parsed, err := parseCliArguments(args)
+func mustParseCli(args []string, repeatableKeys ...string) *cliArguments {
+	parsed, err := parseCliArguments(args, repeatableKeys...)
 	if err != nil {
 		panic(err)
 	}

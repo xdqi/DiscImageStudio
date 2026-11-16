@@ -282,12 +282,9 @@ func (p *UdfDispersedPlan) FileSize(index int) int64 { return p.files[index].dat
 // FileName returns the UDF file name of file index.
 func (p *UdfDispersedPlan) FileName(index int) string { return p.files[index].name }
 
-// FindFile resolves a '/'-separated path relative to the volume root (the
-// data directory's root) to a file index for FileSize/FileName/.... Only
-// regular files resolve: directories, symlinks and missing names give
-// ok=false. Empty and "." components are ignored; matching is case-sensitive,
-// like the source tree.
-func (p *UdfDispersedPlan) FindFile(path string) (index int, ok bool) {
+// splitImagePath splits a '/'-separated image-root-relative path into its
+// components, ignoring empty and "." components.
+func splitImagePath(path string) []string {
 	var components []string
 	for _, part := range strings.Split(path, "/") {
 		if part == "" || part == "." {
@@ -295,9 +292,18 @@ func (p *UdfDispersedPlan) FindFile(path string) (index int, ok bool) {
 		}
 		components = append(components, part)
 	}
-	if len(components) == 0 {
-		return 0, false
-	}
+	return components
+}
+
+// cleanImagePath is splitImagePath joined back: the canonical relative form.
+func cleanImagePath(path string) string {
+	return strings.Join(splitImagePath(path), "/")
+}
+
+// walkImagePath resolves components from the volume root; nil when the path
+// does not exist. The root itself resolves for the empty path.
+func (p *UdfDispersedPlan) walkImagePath(path string) *udfNode {
+	components := splitImagePath(path)
 	node := p.layout.nodes[0] // the root directory
 	for _, component := range components {
 		var next *udfNode
@@ -308,11 +314,21 @@ func (p *UdfDispersedPlan) FindFile(path string) (index int, ok bool) {
 			}
 		}
 		if next == nil {
-			return 0, false
+			return nil
 		}
 		node = next
 	}
-	if node.isDirectory || node.isSymlink {
+	return node
+}
+
+// FindFile resolves a '/'-separated path relative to the volume root (the
+// data directory's root) to a file index for FileSize/FileName/.... Only
+// regular files resolve: directories, symlinks and missing names give
+// ok=false. Empty and "." components are ignored; matching is case-sensitive,
+// like the source tree.
+func (p *UdfDispersedPlan) FindFile(path string) (index int, ok bool) {
+	node := p.walkImagePath(path)
+	if node == nil || node == p.layout.nodes[0] || node.isDirectory || node.isSymlink {
 		return 0, false
 	}
 	for index, file := range p.files {
@@ -321,6 +337,59 @@ func (p *UdfDispersedPlan) FindFile(path string) (index int, ok bool) {
 		}
 	}
 	return 0, false
+}
+
+// ExposureFile is one regular file an --expose path resolved to.
+type ExposureFile struct {
+	Index int    // the plan's file index (FileSize/FileName/...)
+	Path  string // image-root-relative, '/'-separated
+}
+
+// WalkExposure resolves an --expose path relative to the volume root. A
+// regular file yields just that file; a directory yields every regular file
+// under it (recursively) plus the directory itself and all subdirectories, so
+// the ISO9660 bridge can create even empty directories. The volume root is
+// allowed. Symlinks found during directory expansion are skipped; a symlink
+// as the path itself, or a missing name, gives ok=false.
+func (p *UdfDispersedPlan) WalkExposure(path string) (files []ExposureFile, dirs []string, ok bool) {
+	node := p.walkImagePath(path)
+	if node == nil || node.isSymlink {
+		return nil, nil, false
+	}
+	clean := cleanImagePath(path)
+	if !node.isDirectory {
+		for index, file := range p.files {
+			if file == node {
+				return []ExposureFile{{Index: index, Path: clean}}, nil, true
+			}
+		}
+		return nil, nil, false
+	}
+	index := make(map[*udfNode]int, len(p.files))
+	for i, file := range p.files {
+		index[file] = i
+	}
+	dirs = append(dirs, clean)
+	var walk func(dir *udfNode, dirPath string)
+	walk = func(dir *udfNode, dirPath string) {
+		for _, child := range dir.children {
+			childPath := child.name
+			if dirPath != "" {
+				childPath = dirPath + "/" + child.name
+			}
+			switch {
+			case child.isSymlink:
+				// Skipped: not representable in the bridge's plain ISO9660.
+			case child.isDirectory:
+				dirs = append(dirs, childPath)
+				walk(child, childPath)
+			default:
+				files = append(files, ExposureFile{Index: index[child], Path: childPath})
+			}
+		}
+	}
+	walk(node, clean)
+	return files, dirs, true
 }
 
 // FileSourcePath returns the source path of file index, "" for extras and
