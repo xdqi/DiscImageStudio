@@ -3,6 +3,7 @@ package dvd
 import (
 	"fmt"
 	"math"
+	"slices"
 )
 
 // This file implements the 3-tone mapper: the picture conversion that decides
@@ -15,9 +16,6 @@ import (
 // or pure-white area (morphological interior with a physical margin).
 
 const (
-	// Samples per sector for the tone statistics.
-	mapSamplesPerSector = 8
-
 	// Polar erosion grid resolution: radial cells of ~0.05 mm, 256 arc bins
 	// per turn. Used only for the interior-of-flat-area morphology.
 	erosionArcBins  = 256
@@ -32,10 +30,13 @@ type disperseToneMap struct {
 
 	sectorArcMm float64
 
-	// Per-sector luminance samples (in physical track order).
-	sectorSamples  [][]byte
-	alphaThreshold byte
-	lumThreshold   byte
+	// Per-sector luminance samples along the whole arc (~one per image
+	// pixel), sorted ascending for binary-search statistics. Flat storage,
+	// sectorSampleStride per sector.
+	sectorSamples      []byte
+	sectorSampleStride int
+	alphaThreshold     byte
+	lumThreshold       byte
 
 	// Polar erosion grid: turns × arcs, cell center luminance.
 	gridTurns int
@@ -66,15 +67,19 @@ func buildDisperseToneMap(image *rasterImage, options imageMappingOptions) (*dis
 	m.sectorArcMm = dvdChannelBitsPerSector * bitLengthMm
 
 	sectors := int(options.TotalSectors)
-	m.sectorSamples = make([][]byte, sectors)
 	samplingOuter := options.samplingOuterRadiusMm()
+	// Sample every image pixel along each sector's arc (a sector's arc spans
+	// ~46 px here): thin picture features (text strokes, outlines) must not
+	// slip between samples and turn a sector into "pure background".
+	pxPerMm := (float64(minInt(image.width, image.height)) - 1) / (2 * samplingOuter)
+	steps := int(math.Ceil(m.sectorArcMm*pxPerMm)) + 1
+	m.sectorSampleStride = steps
+	m.sectorSamples = make([]byte, sectors*steps)
 	for sector := 0; sector < sectors; sector++ {
-		samples := make([]byte, mapSamplesPerSector)
-		for k := 0; k < mapSamplesPerSector; k++ {
-			// Sample at the codeword-center positions across the sector's arc.
-			channelBit := float64(sector)*dvdChannelBitsPerSector +
-				(float64(k)+0.5)*dvdChannelBitsPerSector/mapSamplesPerSector
-			arcMm := channelBit * bitLengthMm
+		row := m.sectorSamples[sector*steps : (sector+1)*steps]
+		arc0 := float64(sector) * m.sectorArcMm
+		for k := 0; k < steps; k++ {
+			arcMm := arc0 + float64(k)*m.sectorArcMm/float64(steps)
 			radius, trackAngle := spiral.atArcLengthFast(arcMm)
 			polarAngle := -trackAngle // clockwise, like the writer
 			x := radius * math.Cos(polarAngle)
@@ -82,12 +87,12 @@ func buildDisperseToneMap(image *rasterImage, options imageMappingOptions) (*dis
 			// Image y-down vs physical y-up (the engine flips; a tone map is
 			// mirror-invariant for luminance, but keep the exact mapping).
 			sample := image.sampleDisc(x, -y, samplingOuter, true)
-			samples[k] = sample.Luminance
+			row[k] = sample.Luminance
 			if sample.Alpha < m.alphaThreshold {
-				samples[k] = 255 // unconstrained reads as white
+				row[k] = 255 // unconstrained reads as white
 			}
 		}
-		m.sectorSamples[sector] = samples
+		slices.Sort(row)
 	}
 	if err := m.buildErosionGrid(); err != nil {
 		return nil, err
@@ -140,18 +145,31 @@ func (m *disperseToneMap) buildErosionGrid() error {
 	return nil
 }
 
-// sectorClass computes the per-cell tone class under a gray band [t1,t2].
+// sectorToneStats computes the per-cell tone class under a gray band [t1,t2]:
+// gray = in-band, white = above the band and at/above the luminance threshold,
+// black = the rest. The per-sector samples are sorted, so counts are binary
+// searches.
 func (m *disperseToneMap) sectorToneStats(t1, t2 byte, sector int) (gray, white, black int) {
-	for _, lum := range m.sectorSamples[sector] {
-		switch {
-		case lum >= t1 && lum <= t2:
-			gray++
-		case lum >= m.lumThreshold:
-			white++
-		default:
-			black++
-		}
+	row := m.sectorSamples[sector*m.sectorSampleStride : (sector+1)*m.sectorSampleStride]
+	// White means "not gray and at/above the luminance threshold" (the gray
+	// band wins for in-band tones).
+	whiteLow := int(m.lumThreshold)
+	if int(t2)+1 > whiteLow {
+		whiteLow = int(t2) + 1
 	}
+	search := func(v int) int {
+		if v > 255 {
+			return len(row)
+		}
+		i, _ := slices.BinarySearch(row, byte(v))
+		return i
+	}
+	lo := search(int(t1))
+	hi := search(int(t2) + 1)
+	ws := search(whiteLow)
+	gray = hi - lo
+	white = len(row) - ws
+	black = len(row) - gray - white
 	return
 }
 
@@ -267,7 +285,7 @@ func (m *disperseToneMap) sectorInterior2(sector int, whiteIntW, blackIntW, whit
 func (m *disperseToneMap) classifySectors(t1, t2 byte, marginWhiteMm, marginBlackMm float64) []bool {
 	whiteInt, blackInt := m.erodedInteriors(marginWhiteMm)
 	whiteIntB, blackIntB := m.erodedInteriors(marginBlackMm)
-	sectors := len(m.sectorSamples)
+	sectors := len(m.sectorSamples) / m.sectorSampleStride
 	eligible := make([]bool, sectors)
 	for sector := 0; sector < sectors; sector++ {
 		gray, white, black := m.sectorToneStats(t1, t2, sector)

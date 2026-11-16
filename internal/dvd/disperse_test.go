@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -677,32 +678,36 @@ func TestPlaceDispersionTooManyExtents(t *testing.T) {
 
 // fakeDisperseToneMap builds a tone map from per-sector sample rows so the
 // planner can be tested without a real picture. sectorPattern returns the
-// mapSamplesPerSector luminance samples of a sector; use solidLum for
+// fakeSamplesPerSector luminance samples of a sector; use solidLum for
 // gray-in-band sectors and mixLum for everything else (a mixed row is never
 // a "pure" tone, so the erosion-grid interior path is never consulted and
 // the spiral can stay nil).
+const fakeSamplesPerSector = 8
+
 func fakeDisperseToneMap(t *testing.T, total int, sectorPattern func(sector int) []byte) *disperseToneMap {
 	t.Helper()
-	samples := make([][]byte, total)
+	samples := make([]byte, total*fakeSamplesPerSector)
 	for s := 0; s < total; s++ {
 		row := sectorPattern(s)
-		if len(row) != mapSamplesPerSector {
+		if len(row) != fakeSamplesPerSector {
 			t.Fatalf("sector %d pattern has %d samples", s, len(row))
 		}
-		samples[s] = row
+		slices.Sort(row)
+		copy(samples[s*fakeSamplesPerSector:(s+1)*fakeSamplesPerSector], row)
 	}
 	return &disperseToneMap{
-		sectorSamples: samples,
-		lumThreshold:  128,
-		gridTurns:     1,
-		gridArcs:      erosionArcBins,
-		turnRadii:     []float64{25},
-		gridLum:       make([]byte, erosionArcBins),
+		sectorSamples:      samples,
+		sectorSampleStride: fakeSamplesPerSector,
+		lumThreshold:       128,
+		gridTurns:          1,
+		gridArcs:           erosionArcBins,
+		turnRadii:          []float64{25},
+		gridLum:            make([]byte, erosionArcBins),
 	}
 }
 
 func solidLum(lum byte) []byte {
-	row := make([]byte, mapSamplesPerSector)
+	row := make([]byte, fakeSamplesPerSector)
 	for k := range row {
 		row[k] = lum
 	}
@@ -712,7 +717,7 @@ func solidLum(lum byte) []byte {
 // mixLum returns a row of 7×a + 1×b samples.
 func mixLum(a, b byte) []byte {
 	row := solidLum(a)
-	row[mapSamplesPerSector-1] = b
+	row[fakeSamplesPerSector-1] = b
 	return row
 }
 
