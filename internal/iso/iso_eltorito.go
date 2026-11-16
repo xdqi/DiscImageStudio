@@ -22,8 +22,10 @@ const (
 	bridgeBootRecordLba    uint32 = 17
 	bridgeSupplementaryLba uint32 = 18
 	bridgeTerminatorLba    uint32 = 19
-	bridgePathTableLba     uint32 = 50 // 32..49 are UDF descriptors
-	bridgeAnchorLba        uint32 = 256
+	// BridgeVrsLba is where the UDF volume recognition sequence starts on a
+	// bridge disc, right after the ISO9660/El Torito descriptors.
+	BridgeVrsLba       uint32 = 20
+	bridgePathTableLba uint32 = 50 // 32..49 are UDF descriptors
 
 	maxBootImageBytes = int64(2048) * 2048 * 2048
 
@@ -268,9 +270,9 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 	}
 	b.catalogLba = cursor
 	cursor++
-	if cursor > bridgeAnchorLba {
+	if cursor > UdfAnchorLba {
 		return nil, fmt.Errorf("The ISO9660/El Torito bridge tree needs %d sectors but must end before sector %d; expose fewer files. (Parameter 'exposed')",
-			cursor-bridgePathTableLba, bridgeAnchorLba)
+			cursor-bridgePathTableLba, UdfAnchorLba)
 	}
 	b.catalogNode.dataLba = b.catalogLba
 	return b, nil

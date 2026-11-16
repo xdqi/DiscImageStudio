@@ -195,7 +195,7 @@ func udfDisperseTestFileEntry(t *testing.T, image []byte, lba uint32) (int64, []
 	for offset := 176; offset < 176+adBytes; offset += 8 {
 		length := binary.LittleEndian.Uint32(sector[offset:]) & 0x3fffffff
 		position := binary.LittleEndian.Uint32(sector[offset+4:])
-		ads = append(ads, udfDisperseTestAd{length, udfFirstPartitionLba + position})
+		ads = append(ads, udfDisperseTestAd{length, UdfFirstPartitionLba + position})
 	}
 	return dataLength, ads
 }
@@ -225,7 +225,7 @@ func udfDisperseTestReadDir(t *testing.T, image []byte, feLba uint32) map[string
 			if len(identifier) == 0 || identifier[0] != 8 {
 				t.Fatalf("unexpected file identifier encoding %v", identifier)
 			}
-			files[string(identifier[1:])] = udfFirstPartitionLba + icbLbn
+			files[string(identifier[1:])] = UdfFirstPartitionLba + icbLbn
 		}
 		offset += (38+identifierBytes+3)/4*4 + implementationBytes
 	}
@@ -270,8 +270,8 @@ func TestUdfDispersedStructure(t *testing.T) {
 	if plan.FileBytes() != int64(len(alpha)+len(beta)+len(extraContent)) {
 		t.Fatalf("FileBytes = %d", plan.FileBytes())
 	}
-	if plan.PartitionStartLba() != udfFirstPartitionLba {
-		t.Fatalf("PartitionStartLba = %d, want %d", plan.PartitionStartLba(), udfFirstPartitionLba)
+	if plan.PartitionStartLba() != UdfFirstPartitionLba {
+		t.Fatalf("PartitionStartLba = %d, want %d", plan.PartitionStartLba(), UdfFirstPartitionLba)
 	}
 	// Root + 3 files = 4 file entries at 290..293; root directory data 1 sector at 294.
 	if plan.MetaEndLbaExclusive() != 295 {
@@ -286,7 +286,7 @@ func TestUdfDispersedStructure(t *testing.T) {
 	if plan.FileSourcePath(2) != "" {
 		t.Fatalf("FileSourcePath(2) = %q, want \"\" for the extra file", plan.FileSourcePath(2))
 	}
-	if _, ok := plan.DescriptorAt(udfFirstPartitionLba); ok {
+	if _, ok := plan.DescriptorAt(UdfFirstPartitionLba); ok {
 		t.Fatal("DescriptorAt must not be callable before AssignExtents")
 	}
 
@@ -344,12 +344,12 @@ func TestUdfDispersedStructure(t *testing.T) {
 			t.Fatalf("anchor tag id at sector %d = %d, want 2", lba, got)
 		}
 	}
-	if got := binary.LittleEndian.Uint16(image[udfFirstPartitionLba*LogicalSectorBytes:]); got != 256 {
-		t.Fatalf("file set descriptor tag id at sector %d = %d, want 256", udfFirstPartitionLba, got)
+	if got := binary.LittleEndian.Uint16(image[UdfFirstPartitionLba*LogicalSectorBytes:]); got != 256 {
+		t.Fatalf("file set descriptor tag id at sector %d = %d, want 256", UdfFirstPartitionLba, got)
 	}
 	// Root file entry ICB comes from the file set descriptor.
-	fsd := image[udfFirstPartitionLba*LogicalSectorBytes:]
-	rootFeLba := udfFirstPartitionLba + binary.LittleEndian.Uint32(fsd[404:408])
+	fsd := image[UdfFirstPartitionLba*LogicalSectorBytes:]
+	rootFeLba := UdfFirstPartitionLba + binary.LittleEndian.Uint32(fsd[404:408])
 	files := udfDisperseTestReadDir(t, image, rootFeLba)
 	want := map[string][]byte{"alpha.txt": alpha, "beta.bin": beta, "EXTRA.DAT": extraContent}
 	if len(files) != len(want) {
@@ -481,7 +481,7 @@ func TestUdfDispersedAssignErrors(t *testing.T) {
 	}
 	// A valid assignment leaves the plan usable.
 	plan := prepare(t)
-	if _, ok := plan.DescriptorAt(udfFirstPartitionLba); ok {
+	if _, ok := plan.DescriptorAt(UdfFirstPartitionLba); ok {
 		t.Fatal("DescriptorAt before AssignExtents = ok, want false")
 	}
 	if err := plan.AssignExtents(map[int][]UdfFileExtent{
@@ -490,7 +490,7 @@ func TestUdfDispersedAssignErrors(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := plan.DescriptorAt(udfFirstPartitionLba); !ok {
+	if _, ok := plan.DescriptorAt(UdfFirstPartitionLba); !ok {
 		t.Fatal("DescriptorAt after AssignExtents = false, want ok")
 	}
 }
@@ -790,8 +790,8 @@ func TestUdfDispersedOwnershipAndModes(t *testing.T) {
 		}
 	}
 
-	fsd := image[udfFirstPartitionLba*LogicalSectorBytes:]
-	rootFeLba := udfFirstPartitionLba + binary.LittleEndian.Uint32(fsd[404:408])
+	fsd := image[UdfFirstPartitionLba*LogicalSectorBytes:]
+	rootFeLba := UdfFirstPartitionLba + binary.LittleEndian.Uint32(fsd[404:408])
 	check(rootFeLba, 0x1c21, "root directory") // rwx--x--x
 	files := udfDisperseTestReadDir(t, image, rootFeLba)
 	check(files["secret.txt"], 0x1800, "secret.txt") // rw-------

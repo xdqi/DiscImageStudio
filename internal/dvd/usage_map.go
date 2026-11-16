@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 
+	"disc-image-studio/internal/iso"
 	"disc-image-studio/internal/raster"
 )
 
@@ -51,8 +52,8 @@ func classifySolveSectors(totalSectors, startLba, fillSectors uint32, hybrid *hy
 func classifyDispersedSectors(totalSectors, metaEnd uint32, eligible []bool, extents []fileExtent) []uint8 {
 	classes := make([]uint8, totalSectors)
 	reserveFrom := uint32(0)
-	if totalSectors >= 257 {
-		reserveFrom = totalSectors - 257
+	if totalSectors >= iso.UdfReserveTailSectors {
+		reserveFrom = totalSectors - iso.UdfReserveTailSectors
 	}
 	for lba := uint32(0); lba < totalSectors; lba++ {
 		class := uint8(sectorUsagePicture)

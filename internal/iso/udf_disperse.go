@@ -55,12 +55,13 @@ type UdfDispersedPlan struct {
 // PrepareUdfDispersed scans the source tree exactly like planUdf (same
 // ordering, identifiers, timestamps, uniqueIds starting at len(nodes)+15),
 // then lays out the partition metadata (FSD at partitionStart, file entries,
-// directory data) contiguously from udfFirstPartitionLba — IDENTICAL to
+// directory data) contiguously from UdfFirstPartitionLba — IDENTICAL to
 // planUdf's metadata layout (but no file data follows). An empty
 // sourceDirectory means no tree files.
 // extraFiles become additional root children (after the tree's root children)
 // with the given names/sizes; their identifier encoding uses udfEncodeIdentifier.
-// vrsStart is 16 normally, 19 when an ISO9660 layer occupies 16-18 (UDF bridge).
+// vrsStart is UdfVrsLba (16) normally, BridgeVrsLba (20) on a UDF bridge disc
+// (the ISO9660/El Torito descriptors occupy 16-19).
 func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLabel string,
 	vrsStart uint32, extraFiles []UdfExtraFile) (*UdfDispersedPlan, error) {
 	if volumeSectors < UdfMinimumVolumeSectors || volumeSectors%32 != 0 {
@@ -169,7 +170,7 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 
 	// Metadata layout identical to planUdf: file entries from partitionStart+2,
 	// then directory data. File data is placed later via AssignExtents.
-	cursor := uint64(udfFirstPartitionLba + 2)
+	cursor := uint64(UdfFirstPartitionLba + 2)
 	for _, node := range nodes {
 		if cursor > math.MaxUint32 {
 			return nil, errOverflow
@@ -206,8 +207,8 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 		node.dataLba = uint32(cursor)
 		cursor += uint64(sectorCount(node.dataLength))
 	}
-	if cursor > uint64(volumeSectors)-257 {
-		return nil, fmt.Errorf("UDF metadata needs %d sectors, reaching beyond the backup metadata at sector %d.", cursor, uint64(volumeSectors)-257)
+	if cursor > uint64(volumeSectors)-UdfReserveTailSectors {
+		return nil, fmt.Errorf("UDF metadata needs %d sectors, reaching beyond the backup metadata at sector %d.", cursor, uint64(volumeSectors)-UdfReserveTailSectors)
 	}
 
 	label := volumeLabel
@@ -239,7 +240,7 @@ func PrepareUdfDispersed(sourceDirectory string, volumeSectors uint32, volumeLab
 		directoryCount:      len(nodes) - fileCount,
 		fileBytes:           fileBytes,
 		dataEndLbaExclusive: uint32(cursor), // metadata-only until AssignExtents
-		partitionStartLba:   udfFirstPartitionLba,
+		partitionStartLba:   UdfFirstPartitionLba,
 		nodes:               nodes,
 	}
 	return &UdfDispersedPlan{
@@ -472,7 +473,7 @@ func (p *UdfDispersedPlan) AssignExtents(extents map[int][]UdfFileExtent) error 
 	}
 	type placedExtent struct{ start, end uint64 }
 	var all []placedExtent
-	reserveTail := uint64(p.layout.volumeSectors) - 257
+	reserveTail := uint64(p.layout.volumeSectors) - UdfReserveTailSectors
 	partitionEnd := uint64(p.metaEndLbaExclusive)
 	perFile := make([][]UdfFileExtent, len(p.files))
 	for index, node := range p.files {
@@ -578,13 +579,13 @@ func (p *UdfDispersedPlan) renderDescriptors(perFile [][]UdfFileExtent) (map[uin
 	rendered[p.vrsStart] = udfVolumeRecognition("BEA01")
 	rendered[p.vrsStart+1] = udfVolumeRecognition("NSR03")
 	rendered[p.vrsStart+2] = udfVolumeRecognition("TEA01")
-	if err := udfDispersedRenderVds(plan, rendered, udfMainVdsLba); err != nil {
+	if err := udfDispersedRenderVds(plan, rendered, UdfMainVdsLba); err != nil {
 		return nil, err
 	}
-	rendered[udfIntegrityLba] = udfIntegrityDescriptor(plan)
-	rendered[udfIntegrityLba+1] = udfDescriptor(8, udfIntegrityLba+1, 512)
-	rendered[256] = udfAnchor(plan, 256)
-	rendered[plan.volumeSectors-257] = udfAnchor(plan, plan.volumeSectors-257)
+	rendered[UdfIntegrityLba] = udfIntegrityDescriptor(plan)
+	rendered[UdfIntegrityLba+1] = udfDescriptor(8, UdfIntegrityLba+1, 512)
+	rendered[UdfAnchorLba] = udfAnchor(plan, UdfAnchorLba)
+	rendered[plan.volumeSectors-UdfReserveTailSectors] = udfAnchor(plan, plan.volumeSectors-UdfReserveTailSectors)
 	if err := udfDispersedRenderVds(plan, rendered, plan.ReserveVdsLba()); err != nil {
 		return nil, err
 	}
@@ -640,7 +641,7 @@ func udfDispersedRenderVds(plan *UdfLayoutPlan, rendered map[uint32][]byte, star
 	udfSetTag(unallocated, 7, start+4, 24)
 	rendered[start+4] = unallocated
 	rendered[start+5] = udfDescriptor(8, start+5, 512)
-	for lba := start + 6; lba < start+udfVdsSectors; lba++ {
+	for lba := start + 6; lba < start+UdfVdsSectors; lba++ {
 		rendered[lba] = make([]byte, LogicalSectorBytes)
 	}
 	return nil

@@ -103,8 +103,9 @@ func (p *UdfLayoutPlan) DrawingEndLbaExclusive() uint32 { return p.drawingEndLba
 func (p *UdfLayoutPlan) FilesAtOuterRing() bool         { return p.filesAtOuterRing }
 func (p *UdfLayoutPlan) PartitionStartLba() uint32      { return p.partitionStartLba }
 
-// ReserveVdsLba is the backup descriptor sequence start.
-func (p *UdfLayoutPlan) ReserveVdsLba() uint32 { return p.volumeSectors - 256 }
+// ReserveVdsLba is the backup descriptor sequence start, right after the
+// reserve anchor.
+func (p *UdfLayoutPlan) ReserveVdsLba() uint32 { return p.volumeSectors - (UdfReserveTailSectors - 1) }
 
 // PartitionSectors is the physical partition length.
 func (p *UdfLayoutPlan) PartitionSectors() uint32 { return p.dataEndLbaExclusive - p.partitionStartLba }

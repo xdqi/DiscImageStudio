@@ -92,9 +92,9 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	// The boot image (bridge mode) is a file inside the data directory, named
 	// by its image-root-relative path; it is placed contiguously and shared
 	// between the El Torito catalog and its UDF file entry — no extra copy.
-	vrsStart := uint32(16)
+	vrsStart := uint32(iso.UdfVrsLba)
 	if bridge {
-		vrsStart = 20
+		vrsStart = iso.BridgeVrsLba
 	}
 	udfPlan, err := iso.PrepareUdfDispersed(dataDir, imageMapping.TotalSectors, volumeLabel, vrsStart, nil)
 	if err != nil {
@@ -171,13 +171,13 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	// from placement via the reserved ranges; this list is the sidecar report.
 	u32 := func(v uint32) *uint32 { return &v }
 	fixed := []isoConstraint{
-		{role: "udf-vrs", length: 3, fixedAt: u32(vrsStart)},
-		{role: "udf-main-vds", length: 16, fixedAt: u32(32)},
-		{role: "udf-integrity", length: 2, fixedAt: u32(48)},
-		{role: "udf-anchor", length: 1, fixedAt: u32(256)},
-		{role: "udf-partition-meta", length: metaEnd - 288, fixedAt: u32(288)},
-		{role: "udf-reserve-anchor", length: 1, fixedAt: u32(totalSectors - 257)},
-		{role: "udf-reserve-vds", length: 16, fixedAt: u32(totalSectors - 256)},
+		{role: "udf-vrs", length: iso.UdfVrsSectors, fixedAt: u32(vrsStart)},
+		{role: "udf-main-vds", length: iso.UdfVdsSectors, fixedAt: u32(iso.UdfMainVdsLba)},
+		{role: "udf-integrity", length: iso.UdfIntegritySectors, fixedAt: u32(iso.UdfIntegrityLba)},
+		{role: "udf-anchor", length: 1, fixedAt: u32(iso.UdfAnchorLba)},
+		{role: "udf-partition-meta", length: metaEnd - iso.UdfFirstPartitionLba, fixedAt: u32(iso.UdfFirstPartitionLba)},
+		{role: "udf-reserve-anchor", length: 1, fixedAt: u32(totalSectors - iso.UdfReserveTailSectors)},
+		{role: "udf-reserve-vds", length: iso.UdfVdsSectors, fixedAt: u32(totalSectors - iso.UdfReserveTailSectors + 1)},
 		{role: "udf-anchor", length: 1, fixedAt: u32(totalSectors - 1)},
 	}
 	if bridge {
@@ -236,7 +236,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		marginBlack:    marginBlack,
 		toneMap:        toneMap,
 		reservedBefore: metaEnd,
-		reservedAfter:  totalSectors - 257,
+		reservedAfter:  totalSectors - iso.UdfReserveTailSectors,
 	})
 	if err != nil {
 		return err
@@ -302,7 +302,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		},
 		gray:       plan.eligible,
 		grayBefore: metaEnd,
-		grayFrom:   totalSectors - 257,
+		grayFrom:   totalSectors - iso.UdfReserveTailSectors,
 		readFileContent: func(fileIndex int, offset int64, buf []byte) error {
 			content, ok, err := udfPlan.FileContent(fileIndex)
 			if err != nil {

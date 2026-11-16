@@ -16,11 +16,34 @@ import (
 	"time"
 )
 
+// Volume layout (2048-byte sectors), per ECMA-167 (3rd edition) and UDF 2.01
+// (ECMA TR/112-4): the Volume Recognition Sequence follows the 32 KiB system
+// area; the Anchor Volume Descriptor Pointer sits at the fixed sector 256 and
+// again at N-257 (reserve) and N-1.
 const (
-	udfMainVdsLba        = 32
-	udfVdsSectors        = 16
-	udfIntegrityLba      = 48
-	udfFirstPartitionLba = 288
+	// UdfVrsLba is the first sector of the ECMA-167 Volume Recognition
+	// Sequence (BEA01, NSR03, TEA01), right after the 32 KiB system area.
+	UdfVrsLba = 16
+	// UdfVrsSectors is the Volume Recognition Sequence length in sectors.
+	UdfVrsSectors = 3
+	// UdfMainVdsLba is the fixed main Volume Descriptor Sequence location
+	// (the anchor VDP points here).
+	UdfMainVdsLba = 32
+	// UdfVdsSectors is the Volume Descriptor Sequence length in sectors.
+	UdfVdsSectors = 16
+	// UdfIntegrityLba is the Logical Volume Integrity Sequence location.
+	UdfIntegrityLba = 48
+	// UdfIntegritySectors is the integrity sequence length in sectors.
+	UdfIntegritySectors = 2
+	// UdfAnchorLba is the fixed Anchor Volume Descriptor Pointer sector.
+	UdfAnchorLba = 256
+	// UdfFirstPartitionLba is the first sector of the physical partition;
+	// the range between the anchor and it holds the partition metadata.
+	UdfFirstPartitionLba = 288
+	// UdfReserveTailSectors is the reserved tail length: the reserve anchor
+	// at N-257, then the reserve VDS and the final anchor at N-1.
+	UdfReserveTailSectors = 257
+
 	// UdfMaximumExtentBytes is the largest byte length one short_ad covers
 	// (the top 2 bits of the length word are the extent type).
 	UdfMaximumExtentBytes = 0x3ffff800
@@ -139,7 +162,7 @@ func planUdf(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 		}
 	}
 
-	cursor := uint64(udfFirstPartitionLba + 2)
+	cursor := uint64(UdfFirstPartitionLba + 2)
 	for _, node := range nodes {
 		if cursor > math.MaxUint32 {
 			return nil, errOverflow
@@ -188,25 +211,25 @@ func planUdf(sourceDirectory string, volumeSectors uint32, volumeLabel string, f
 		node.dataLba = uint32(cursor)
 		cursor += uint64(sectorCount(node.dataLength))
 	}
-	drawingEnd := uint64(volumeSectors-257) / 32 * 32
+	drawingEnd := uint64(volumeSectors-UdfReserveTailSectors) / 32 * 32
 	drawingStart := (cursor + 31) / 32 * 32
 	if drawingStart >= drawingEnd {
 		return nil, fmt.Errorf("Files and UDF metadata need %d sectors, leaving no complete drawing cluster before the backup metadata at sector %d.", cursor, drawingEnd)
 	}
-	partitionStart := uint64(udfFirstPartitionLba)
+	partitionStart := uint64(UdfFirstPartitionLba)
 	if filesAtOuterRing {
 		// Relocate the entire physical partition, keeping picture bytes outside it.
 		// Its relative addresses stay identical; only the descriptor's partition
 		// origin and the absolute sequential write positions change.
-		partitionSectors := cursor - udfFirstPartitionLba
+		partitionSectors := cursor - UdfFirstPartitionLba
 		partitionStart = (drawingEnd - partitionSectors) / 32 * 32
-		shift := partitionStart - udfFirstPartitionLba
+		shift := partitionStart - UdfFirstPartitionLba
 		for _, node := range nodes {
 			node.entryLba += uint32(shift)
 			node.dataLba += uint32(shift)
 		}
 		cursor += shift
-		drawingStart = udfFirstPartitionLba
+		drawingStart = UdfFirstPartitionLba
 		drawingEnd = partitionStart
 	}
 	label := volumeLabel
@@ -260,25 +283,25 @@ func writeUdfSequentialPrefix(plan *UdfLayoutPlan, output io.Writer, endLbaExclu
 		return err
 	}
 	writer := newUdfSequentialWriter(output, 0, ctx)
-	if err := writer.writeAtLba(16, udfVolumeRecognition("BEA01")); err != nil {
+	if err := writer.writeAtLba(UdfVrsLba, udfVolumeRecognition("BEA01")); err != nil {
 		return err
 	}
-	if err := writer.writeAtLba(17, udfVolumeRecognition("NSR03")); err != nil {
+	if err := writer.writeAtLba(UdfVrsLba+1, udfVolumeRecognition("NSR03")); err != nil {
 		return err
 	}
-	if err := writer.writeAtLba(18, udfVolumeRecognition("TEA01")); err != nil {
+	if err := writer.writeAtLba(UdfVrsLba+2, udfVolumeRecognition("TEA01")); err != nil {
 		return err
 	}
-	if err := udfWriteVolumeDescriptors(plan, writer, udfMainVdsLba); err != nil {
+	if err := udfWriteVolumeDescriptors(plan, writer, UdfMainVdsLba); err != nil {
 		return err
 	}
-	if err := writer.writeAtLba(udfIntegrityLba, udfIntegrityDescriptor(plan)); err != nil {
+	if err := writer.writeAtLba(UdfIntegrityLba, udfIntegrityDescriptor(plan)); err != nil {
 		return err
 	}
-	if err := writer.writeAtLba(udfIntegrityLba+1, udfDescriptor(8, udfIntegrityLba+1, 512)); err != nil {
+	if err := writer.writeAtLba(UdfIntegrityLba+1, udfDescriptor(8, UdfIntegrityLba+1, 512)); err != nil {
 		return err
 	}
-	if err := writer.writeAtLba(256, udfAnchor(plan, 256)); err != nil {
+	if err := writer.writeAtLba(UdfAnchorLba, udfAnchor(plan, UdfAnchorLba)); err != nil {
 		return err
 	}
 	if !plan.filesAtOuterRing {
@@ -373,7 +396,7 @@ func writeUdfSequentialSuffix(plan *UdfLayoutPlan, output io.Writer, startLba ui
 			return err
 		}
 	}
-	if err := writer.writeAtLba(plan.volumeSectors-257, udfAnchor(plan, plan.volumeSectors-257)); err != nil {
+	if err := writer.writeAtLba(plan.volumeSectors-UdfReserveTailSectors, udfAnchor(plan, plan.volumeSectors-UdfReserveTailSectors)); err != nil {
 		return err
 	}
 	if err := udfWriteVolumeDescriptors(plan, writer, plan.ReserveVdsLba()); err != nil {
@@ -420,7 +443,7 @@ func udfWriteVolumeDescriptors(plan *UdfLayoutPlan, writer *udfSequentialWriter,
 	if err := writer.writeAtLba(start+5, udfDescriptor(8, start+5, 512)); err != nil {
 		return err
 	}
-	return writer.padToLba(start + udfVdsSectors)
+	return writer.padToLba(start + UdfVdsSectors)
 }
 
 func udfVolumeRecognition(identifier string) []byte {
@@ -499,7 +522,7 @@ func udfLogicalVolumeDescriptor(plan *UdfLayoutPlan, location uint32) ([]byte, e
 	udfU32(data, 264, 6)
 	udfU32(data, 268, 1)
 	udfEntity(data[272:304], udfImplementationId, false, false)
-	udfExtent(data[432:440], LogicalSectorBytes*4, udfIntegrityLba)
+	udfExtent(data[432:440], LogicalSectorBytes*4, UdfIntegrityLba)
 	data[440] = 1
 	data[441] = 6
 	udfU16(data, 442, 1) // Volume sequence number; partition number is zero.
@@ -521,14 +544,14 @@ func udfIntegrityDescriptor(plan *UdfLayoutPlan) []byte {
 	udfU16(data, 128, 0x0201)
 	udfU16(data, 130, 0x0201)
 	udfU16(data, 132, 0x0201)
-	udfSetTag(data, 9, udfIntegrityLba, 134)
+	udfSetTag(data, 9, UdfIntegrityLba, 134)
 	return data
 }
 
 func udfAnchor(plan *UdfLayoutPlan, location uint32) []byte {
 	data := make([]byte, LogicalSectorBytes)
-	udfExtent(data[16:24], udfVdsSectors*LogicalSectorBytes, udfMainVdsLba)
-	udfExtent(data[24:32], udfVdsSectors*LogicalSectorBytes, plan.ReserveVdsLba())
+	udfExtent(data[16:24], UdfVdsSectors*LogicalSectorBytes, UdfMainVdsLba)
+	udfExtent(data[24:32], UdfVdsSectors*LogicalSectorBytes, plan.ReserveVdsLba())
 	udfSetTag(data, 2, location, 512)
 	return data
 }
