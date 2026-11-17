@@ -144,7 +144,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 					continue
 				}
 				seen[file.Index] = true
-				exposed = append(exposed, iso.ExposedFile{Path: file.Path, Size: udfPlan.FileSize(file.Index)})
+				exposed = append(exposed, iso.ExposedFile{Path: file.Path, Size: udfPlan.FileSize(file.Index), Mode: udfPlan.FileMode(file.Index)})
 				exposedIndexes = append(exposedIndexes, file.Index)
 			}
 		}

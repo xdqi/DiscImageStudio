@@ -1,6 +1,7 @@
 package iso
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -586,5 +587,68 @@ func TestElToritoBridgeLargeEfiImage(t *testing.T) {
 	}
 	if efiLoadSectors(0xFFFF*512) != 0xFFFF || efiLoadSectors(0xFFFF*512+1) != 0 {
 		t.Fatal("efiLoadSectors must switch to 0 just past 0xFFFF sectors")
+	}
+}
+
+// TestElToritoBridgeExposedRockRidge: the exposed bridge's primary tree
+// carries Rock Ridge, so readers of the primary tree only (syslinux) find
+// names its d-character identifiers cannot hold — archiso's
+// archiso_sys-linux.cfg would otherwise be ARCHISO_SYS_LINUX.CFG.
+func TestElToritoBridgeExposedRockRidge(t *testing.T) {
+	const volumeSectors = 4096
+	content := []byte("INCLUDE archiso_head.cfg\n")
+	exposed := []ExposedFile{{Path: "boot/syslinux/archiso_sys-linux.cfg", Size: int64(len(content)), Mode: 0o644}}
+	bridge, err := NewElToritoBridge(volumeSectors, "TEST", "boot.img", 4096, "", 0, exposed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.SetPlacements(400, 0, []uint32{410}); err != nil {
+		t.Fatal(err)
+	}
+	image := make([]byte, volumeSectors*LogicalSectorBytes)
+	for _, extent := range bridge.MetadataExtents() {
+		copy(image[int(extent.Lba)*LogicalSectorBytes:], mustBridgeSector(t, bridge, extent.Lba))
+	}
+	copy(image[410*LogicalSectorBytes:], content)
+
+	pvd := image[16*LogicalSectorBytes:]
+	root := parseFullRecords(t, image, binary.LittleEndian.Uint32(pvd[158:162]), binary.LittleEndian.Uint32(pvd[166:170]))
+	if _, ok := root[0].susp["SP"]; !ok || !bytes.Contains(root[0].susp["ER"], []byte("RRIP_1991A")) {
+		t.Fatal("root '.' lacks the SUSP SP / RRIP ER entries")
+	}
+	dir := root
+	for _, name := range []string{"boot", "syslinux"} {
+		var next fullRecord
+		for _, r := range dir[2:] {
+			if r.nmName == name {
+				next = r
+			}
+		}
+		if next.lba == 0 || pxMode(t, next) != 0o040555 {
+			t.Fatalf("directory %s missing or mode %o", name, pxMode(t, next))
+		}
+		dir = parseFullRecords(t, image, next.lba, next.size)
+	}
+	var cfg fullRecord
+	for _, r := range dir[2:] {
+		if r.nmName == "archiso_sys-linux.cfg" {
+			cfg = r
+		}
+	}
+	if cfg.id != "ARCHISO_SYS_LINUX.CFG;1" || cfg.lba != 410 || cfg.size != uint32(len(content)) || pxMode(t, cfg) != 0o100644 {
+		t.Fatalf("archiso_sys-linux.cfg record = %+v (mode %o)", cfg, pxMode(t, cfg))
+	}
+	if xorriso, err := exec.LookPath("xorriso"); err == nil {
+		path := filepath.Join(t.TempDir(), "bridge.iso")
+		if err := os.WriteFile(path, image, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dest := filepath.Join(t.TempDir(), "out")
+		if output, err := exec.Command(xorriso, "-osirrox", "on", "-indev", path, "-extract", "/boot/syslinux/archiso_sys-linux.cfg", dest).CombinedOutput(); err != nil {
+			t.Fatalf("xorriso extract: %v\n%s", err, output)
+		}
+		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, content) {
+			t.Fatalf("extracted content mismatch (%v)", err)
+		}
 	}
 }

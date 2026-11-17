@@ -55,9 +55,12 @@ paths are relative to `--data-dir` and appear at the same path in both
 filesystems. An EFI image over 32 MiB is recorded with load size 0, as xorriso does.
 Repeat `--expose PATH` to expose other files or directories recursively;
 their parent directories are included. Exposed files and boot images occupy
-continuous extents shared with UDF. Joliet-long preserves names up to 103
-UTF-16 code units; the primary ISO9660 view uses normalized names. Names that
-cannot be represented in Joliet are rejected rather than renamed.
+continuous extents shared with UDF. The primary ISO9660 tree carries Rock
+Ridge (exact names, permission bits), so readers of the primary tree only,
+such as syslinux, find names its normalized d-character identifiers cannot
+hold (`archiso_sys-linux.cfg` vs `ARCHISO_SYS_LINUX.CFG`); Joliet-long
+preserves names up to 103 UTF-16 code units. Names that cannot be
+represented in Joliet are rejected rather than renamed.
 
 ### Full ISO9660 tree (`--filesystem udf-full`)
 

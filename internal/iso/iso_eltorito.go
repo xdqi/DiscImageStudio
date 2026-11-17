@@ -39,6 +39,7 @@ const (
 type ExposedFile struct {
 	Path string // image-root-relative, '/'-separated (e.g. "a/b/barz")
 	Size int64
+	Mode uint32 // permission bits for Rock Ridge; 0 means 0444
 }
 
 // BridgeMetadataExtent is one reserved bridge metadata sector, for the
@@ -118,10 +119,10 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 		exposed:       append([]ExposedFile(nil), exposed...),
 	}
 
-	root := &isoNode{isDirectory: true, timestamp: b.timestamp}
+	root := &isoNode{isDirectory: true, timestamp: b.timestamp, mode: 0o555}
 	b.root = root
 	// Named so the identifier machinery produces exactly "BOOT.CAT;1".
-	b.catalogNode = &isoNode{name: "boot.cat", dataLength: LogicalSectorBytes, timestamp: b.timestamp, parent: root}
+	b.catalogNode = &isoNode{name: "boot.cat", dataLength: LogicalSectorBytes, timestamp: b.timestamp, parent: root, mode: 0o444}
 	root.children = []*isoNode{b.catalogNode}
 
 	// The exposed files' parent directories are synthesized on demand;
@@ -142,7 +143,7 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 			}
 			next, ok := directoryPaths[prefix]
 			if !ok {
-				next = &isoNode{name: component, isDirectory: true, timestamp: b.timestamp, parent: current}
+				next = &isoNode{name: component, isDirectory: true, timestamp: b.timestamp, parent: current, mode: 0o555}
 				current.children = append(current.children, next)
 				directoryPaths[prefix] = next
 			}
@@ -153,7 +154,7 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 	// File leaves are shared by clean path: exposing the boot image's path
 	// (or giving both boot flags the same path) must not duplicate nodes.
 	fileNodes := map[string]*isoNode{}
-	addFile := func(path string, size int64) (*isoNode, error) {
+	addFile := func(path string, size int64, mode uint32) (*isoNode, error) {
 		clean := cleanImagePath(path)
 		if node, ok := fileNodes[clean]; ok {
 			if node.dataLength != size {
@@ -173,7 +174,10 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 				return nil, err
 			}
 		}
-		leaf := &isoNode{name: components[len(components)-1], dataLength: size, timestamp: b.timestamp, parent: parent}
+		if mode == 0 {
+			mode = 0o444
+		}
+		leaf := &isoNode{name: components[len(components)-1], dataLength: size, timestamp: b.timestamp, parent: parent, mode: mode}
 		parent.children = append(parent.children, leaf)
 		fileNodes[clean] = leaf
 		return leaf, nil
@@ -185,14 +189,14 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 		}
 	}
 	if legacyBootImagePath != "" {
-		node, err := addFile(legacyBootImagePath, legacyBootImageSize)
+		node, err := addFile(legacyBootImagePath, legacyBootImageSize, 0)
 		if err != nil {
 			return nil, err
 		}
 		b.legacyNode = node
 	}
 	if bootImageName != "" {
-		node, err := addFile(bootImageName, bootImageSize)
+		node, err := addFile(bootImageName, bootImageSize, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -202,7 +206,7 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 		if b.exposed[i].Size < 0 {
 			return nil, fmt.Errorf("The exposed file size cannot be negative: %s (Parameter 'exposed')", b.exposed[i].Path)
 		}
-		node, err := addFile(b.exposed[i].Path, b.exposed[i].Size)
+		node, err := addFile(b.exposed[i].Path, b.exposed[i].Size, b.exposed[i].Mode)
 		if err != nil {
 			return nil, err
 		}
@@ -236,6 +240,12 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 		}
 	}
 	b.directories = directories
+	// The primary tree carries Rock Ridge (exact names, permission bits):
+	// syslinux reads neither Joliet nor anything but the primary names, which
+	// are normalized to d-characters (archiso_sys-linux.cfg would become
+	// ARCHISO_SYS_LINUX.CFG). Records are sized with one section per file.
+	b.assignRockRidgeSerials()
+	b.setSingleSections()
 
 	// Layout: primary path table and directories, Joliet path table and
 	// directories, then the catalog, all before the anchor at 256.
@@ -243,7 +253,10 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 	b.pathTableSectors = uint32(sectorCount(int64(b.pathTableBytes)))
 	cursor := bridgePathTableLba + b.pathTableSectors
 	for _, directory := range directories {
-		directoryBytes := isoDirectoryExtentLength(directory, false, false)
+		directoryBytes, err := b.fullDirectoryBytes(directory, false)
+		if err != nil {
+			return nil, err
+		}
 		directory.primaryDirectoryLba = cursor
 		directory.primaryDirectoryBytes = directoryBytes
 		cursor += uint32(sectorCount(int64(directoryBytes)))
@@ -253,7 +266,11 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 	b.jolietPathTableLba = cursor
 	cursor += b.jolietPathTableSectors
 	for _, directory := range directories {
-		directory.jolietDirectoryBytes = isoDirectoryExtentLength(directory, true, false)
+		directoryBytes, err := b.fullDirectoryBytes(directory, true)
+		if err != nil {
+			return nil, err
+		}
+		directory.jolietDirectoryBytes = directoryBytes
 		directory.jolietDirectoryLba = cursor
 		cursor += uint32(sectorCount(int64(directory.jolietDirectoryBytes)))
 	}
@@ -349,6 +366,7 @@ func (b *ElToritoBridge) SetPlacements(bootImageLba uint32, legacyBootImageLba u
 	if b.legacyNode != nil {
 		b.legacyNode.dataLba = legacyBootImageLba
 	}
+	b.setSingleSections()
 	b.placementsSet = true
 	b.sectors = b.buildSectors()
 	return nil
@@ -435,7 +453,7 @@ func (b *ElToritoBridge) buildSectors() map[uint32][]byte {
 		sectors[b.jolietPathTableLba+i] = sector
 	}
 	for _, directory := range b.directories {
-		extent := isoBuildDirectoryExtent(directory, true, false)
+		extent := b.directoryExtent(directory, true, directory.jolietDirectoryBytes)
 		for k := uint32(0); k < uint32(len(extent))/LogicalSectorBytes; k++ {
 			sectors[directory.jolietDirectoryLba+k] = extent[k*LogicalSectorBytes : (k+1)*LogicalSectorBytes]
 		}
@@ -447,7 +465,7 @@ func (b *ElToritoBridge) buildSectors() map[uint32][]byte {
 		sectors[bridgePathTableLba+i] = sector
 	}
 	for _, directory := range b.directories {
-		extent := isoBuildDirectoryExtent(directory, false, false)
+		extent := b.directoryExtent(directory, false, directory.primaryDirectoryBytes)
 		for k := uint32(0); k < uint32(len(extent))/LogicalSectorBytes; k++ {
 			sectors[directory.primaryDirectoryLba+k] = extent[k*LogicalSectorBytes : (k+1)*LogicalSectorBytes]
 		}

@@ -285,6 +285,9 @@ func (p *UdfDispersedPlan) PartitionStartLba() uint32 { return p.layout.partitio
 // FileSize returns the content length of file index.
 func (p *UdfDispersedPlan) FileSize(index int) int64 { return p.files[index].dataLength }
 
+// FileMode returns the permission bits of file index (from the source).
+func (p *UdfDispersedPlan) FileMode(index int) uint32 { return p.files[index].mode }
+
 // FileName returns the UDF file name of file index.
 func (p *UdfDispersedPlan) FileName(index int) string { return p.files[index].name }
 

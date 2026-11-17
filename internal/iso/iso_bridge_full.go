@@ -257,6 +257,22 @@ func (b *ElToritoBridge) assignRockRidgeSerials() {
 	}
 }
 
+// setSingleSections gives every file of the tree one section at its dataLba,
+// as the exposed bridge stores each file contiguously (empty files: none).
+func (b *ElToritoBridge) setSingleSections() {
+	for _, directory := range b.directories {
+		for _, child := range directory.children {
+			if child.isDirectory || child.isSymlink {
+				continue
+			}
+			child.sections = nil
+			if child.dataLength > 0 {
+				child.sections = []isoSection{{lba: child.dataLba, length: uint32(child.dataLength)}}
+			}
+		}
+	}
+}
+
 func rootHasChild(root *isoNode, name string) bool {
 	for _, child := range root.children {
 		if child.name == name {
