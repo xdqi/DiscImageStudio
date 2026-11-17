@@ -1271,3 +1271,62 @@ func TestDispersedUdfBridgeFullTreeEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestDispersedUdfBridgeGrub2BootInfo: --grub2-boot-info patches a GRUB2
+// eltorito.img like xorriso (its start in 512-byte blocks + 5 at byte 2548,
+// included in the Boot Information Table checksum), --legacy-boot-load-size
+// sets the catalog load size, and a full tree keeps the volume label
+// verbatim (dracut's root=live:CDLABEL= matches it exactly).
+func TestDispersedUdfBridgeGrub2BootInfo(t *testing.T) {
+	dir := t.TempDir()
+	pngPath := writeGradientPng(t, filepath.Join(dir, "gradient.png"), 64)
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "boot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	image := make([]byte, 9000)
+	for i := range image {
+		image[i] = byte(i*29 + 7)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "boot", "eltorito.img"), image, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	isoPath := filepath.Join(dir, "disc.iso")
+	code := RunCommand([]string{
+		"solve", "--image", pngPath, "--iso-output", isoPath,
+		"--total-sectors", "4096", "--data-dir", dataDir,
+		"--filesystem", "udf-full",
+		"--legacy-boot-image", "boot/eltorito.img", "--grub2-boot-info", "true",
+		"--legacy-boot-load-size", "4", "--volume-label", "Fedora-WS-Live-45",
+	})
+	if code != 0 {
+		t.Fatalf("solve exited %d", code)
+	}
+	data, err := os.ReadFile(isoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sector = 2048
+	if got := strings.TrimRight(string(data[16*sector+40:16*sector+72]), " "); got != "Fedora-WS-Live-45" {
+		t.Fatalf("PVD volume identifier = %q, want it verbatim", got)
+	}
+	catalogLba := binary.LittleEndian.Uint32(data[17*sector+71:])
+	entry := data[int(catalogLba)*sector+32 : int(catalogLba)*sector+64]
+	if got := binary.LittleEndian.Uint16(entry[6:8]); got != 4 {
+		t.Fatalf("legacy load size = %d, want 4", got)
+	}
+	bootLba := binary.LittleEndian.Uint32(entry[8:12])
+	onDisc := data[int(bootLba)*sector : int(bootLba)*sector+len(image)]
+	if got := binary.LittleEndian.Uint64(onDisc[iso.Grub2BootInfoOffset:]); got != uint64(bootLba)*4+5 {
+		t.Fatalf("GRUB2 boot info = %d, want %d", got, uint64(bootLba)*4+5)
+	}
+	want := append([]byte(nil), image...)
+	iso.PatchGrub2BootInfo(want, bootLba)
+	iso.PatchBootInfoTable(want, bootLba, int64(len(image)), iso.BootInfoTableChecksum(want))
+	if !bytes.Equal(onDisc, want) {
+		t.Fatal("on-disc boot image differs from the source with the BootInfoTable and GRUB2 boot info patched")
+	}
+	if got := binary.LittleEndian.Uint32(onDisc[20:24]); got != iso.BootInfoTableChecksum(onDisc) {
+		t.Fatalf("bi_csum %#x does not cover the final image (%#x)", got, iso.BootInfoTableChecksum(onDisc))
+	}
+}

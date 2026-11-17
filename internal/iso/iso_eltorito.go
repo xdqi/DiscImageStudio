@@ -91,6 +91,18 @@ type ElToritoBridge struct {
 	treeStartLba          uint32
 	treeEndLba            uint32
 	rockRidgeSerials      map[*isoNode]uint32
+
+	// legacyLoadSectors, when > 0, overrides the x86 legacy BIOS entry's
+	// load size (512-byte units), like xorriso -boot-load-size.
+	legacyLoadSectors uint16
+}
+
+// SetLegacyLoadSectors sets the x86 legacy BIOS entry's load size in 512-byte
+// units (0 restores the default: the whole image, rounded up to 2 KiB). GRUB's
+// eltorito.img is loaded with 4 (2 KiB) and reads the rest itself through
+// its GRUB2 boot info (PatchGrub2BootInfo).
+func (b *ElToritoBridge) SetLegacyLoadSectors(sectors uint16) {
+	b.legacyLoadSectors = sectors
 }
 
 // NewElToritoBridge creates the layer. volumeSectors is the total image size
@@ -541,7 +553,11 @@ func (b *ElToritoBridge) buildBootCatalog() []byte {
 	if b.legacyNode != nil {
 		// x86 legacy BIOS default entry: no-emulation, BootInfoTable, and
 		// the load size rounded up to 2 KiB (4 sectors of 512 bytes each).
-		writeEntry(b.legacyBootLba, uint16((b.legacySize+LogicalSectorBytes-1)/LogicalSectorBytes)*4)
+		loadSectors := uint16((b.legacySize+LogicalSectorBytes-1)/LogicalSectorBytes) * 4
+		if b.legacyLoadSectors > 0 {
+			loadSectors = b.legacyLoadSectors
+		}
+		writeEntry(b.legacyBootLba, loadSectors)
 		offset += 32
 	}
 	if b.bootNode != nil {
@@ -556,6 +572,24 @@ func (b *ElToritoBridge) buildBootCatalog() []byte {
 		offset += 32
 	}
 	return sector
+}
+
+// Grub2BootInfoOffset is the byte offset in a GRUB2 El Torito image
+// (eltorito.img: cdboot.img + core.img) of the 64-bit boot info patched by
+// xorriso --grub2-boot-info.
+const Grub2BootInfoOffset = 2548
+
+// PatchGrub2BootInfo writes the GRUB2 boot info into a boot image held from
+// its start: the image's start in 512-byte blocks plus 5 (imageLba*4 + 5),
+// as a little-endian uint64 at byte 2548 — the block GRUB's cdboot reads the
+// rest of core.img from. The image must extend past byte 2555.
+func PatchGrub2BootInfo(image []byte, imageLba uint32) {
+	binary.LittleEndian.PutUint64(image[Grub2BootInfoOffset:], Grub2BootInfo(imageLba))
+}
+
+// Grub2BootInfo is the GRUB2 boot info value of an image at imageLba.
+func Grub2BootInfo(imageLba uint32) uint64 {
+	return uint64(imageLba)*4 + 5
 }
 
 // efiLoadSectors is the EFI catalog entry's sector count: the image size in

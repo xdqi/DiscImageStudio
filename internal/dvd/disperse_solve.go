@@ -53,6 +53,21 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	if len(exposePaths) > 0 && !bridge {
 		return newArgumentError("--expose requires --filesystem udf-bridge or udf-full.")
 	}
+	// GRUB2's eltorito.img: xorriso --grub2-boot-info and -boot-load-size.
+	grub2BootInfo, err := readBoolean(arguments, "grub2-boot-info", false)
+	if err != nil {
+		return err
+	}
+	legacyLoadSize, err := arguments.GetInt("legacy-boot-load-size", 0)
+	if err != nil {
+		return err
+	}
+	if (grub2BootInfo || arguments.Has("legacy-boot-load-size")) && legacyBootImagePath == "" {
+		return newArgumentError("--grub2-boot-info and --legacy-boot-load-size require --legacy-boot-image.")
+	}
+	if arguments.Has("legacy-boot-load-size") && (legacyLoadSize < 1 || legacyLoadSize > 0xFFFF) {
+		return newArgumentError("--legacy-boot-load-size must be between 1 and 65535 (512-byte units).")
+	}
 	volumeLabel := arguments.Get("volume-label", "DVD_IMAGE")
 
 	imageMapping, err := readImageMappingOptions(arguments, 1)
@@ -176,6 +191,9 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		}
 		if err != nil {
 			return err
+		}
+		if legacyLoadSize > 0 {
+			bridgeLayer.SetLegacyLoadSectors(uint16(legacyLoadSize))
 		}
 	}
 
@@ -336,8 +354,9 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	}
 	// The legacy BIOS boot image gets its Boot Information Table patched into
 	// bytes 8..55 of its first sector (both UDF and the catalog share the
-	// extent, exactly like mkisofs does). The checksum covers the whole file,
-	// so the content is read once here.
+	// extent, exactly like mkisofs does), and with --grub2-boot-info the GRUB2
+	// boot info at byte 2548. The checksum covers the whole file including the
+	// GRUB2 patch (as xorriso computes it), so the content is read once here.
 	if bridge && legacyBootImageIndex >= 0 {
 		content, ok, err := udfPlan.FileContent(legacyBootImageIndex)
 		if err != nil {
@@ -349,11 +368,20 @@ func solveDispersedUdf(arguments *cliArguments) error {
 				return err
 			}
 		}
+		if grub2BootInfo {
+			if len(content) < iso.Grub2BootInfoOffset+8 {
+				return newArgumentError(fmt.Sprintf("--grub2-boot-info needs a boot image of at least %d bytes; %s has %d.",
+					iso.Grub2BootInfoOffset+8, legacyBootImagePath, len(content)))
+			}
+			content = append([]byte(nil), content...)
+			iso.PatchGrub2BootInfo(content, legacyLba)
+		}
 		source.bootInfo = &bootInfoTablePatch{
 			fileIndex: legacyBootImageIndex,
 			lba:       legacyLba,
 			size:      legacyBootImageSize,
 			csum:      iso.BootInfoTableChecksum(content),
+			grub2:     grub2BootInfo,
 		}
 	}
 	var extents []fileExtent

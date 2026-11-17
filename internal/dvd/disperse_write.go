@@ -2,6 +2,7 @@ package dvd
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -38,6 +39,7 @@ type bootInfoTablePatch struct {
 	lba       uint32
 	size      int64
 	csum      uint32
+	grub2     bool // also the GRUB2 boot info at byte 2548 (second sector)
 }
 
 func (s *dispersedSectorSource) Content(lba uint32) ([]byte, bool, error) {
@@ -87,8 +89,13 @@ func (s *dispersedSectorSource) Content(lba uint32) ([]byte, bool, error) {
 					return nil, false, fmt.Errorf("short read on %s", ext.filePath)
 				}
 			}
-			if s.bootInfo != nil && ext.fileIndex == s.bootInfo.fileIndex && offset == 0 {
-				iso.PatchBootInfoTable(data, s.bootInfo.lba, s.bootInfo.size, s.bootInfo.csum)
+			if s.bootInfo != nil && ext.fileIndex == s.bootInfo.fileIndex {
+				switch {
+				case offset == 0:
+					iso.PatchBootInfoTable(data, s.bootInfo.lba, s.bootInfo.size, s.bootInfo.csum)
+				case s.bootInfo.grub2 && offset == iso.Grub2BootInfoOffset/2048*2048:
+					binary.LittleEndian.PutUint64(data[iso.Grub2BootInfoOffset%2048:], iso.Grub2BootInfo(s.bootInfo.lba))
+				}
 			}
 			return data, true, nil
 		}
