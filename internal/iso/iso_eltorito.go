@@ -503,10 +503,23 @@ func (b *ElToritoBridge) buildBootCatalog() []byte {
 			binary.LittleEndian.PutUint16(sector[offset+2:], 1)
 			offset += 32
 		}
-		writeEntry(b.bootImageLba, uint16((b.bootImageSize+511)/512)) // 512-byte units
+		writeEntry(b.bootImageLba, efiLoadSectors(b.bootImageSize))
 		offset += 32
 	}
 	return sector
+}
+
+// efiLoadSectors is the EFI catalog entry's sector count: the image size in
+// 512-byte units, or 0 when that overflows the 16-bit field (images over
+// 32 MiB, e.g. archiso's ESP with the kernel and initramfs). 0 is what
+// xorriso records; UEFI firmware then takes the image to extend from its LBA
+// to the end of the volume and the FAT inside bounds itself (EDK2
+// ElTorito.c).
+func efiLoadSectors(size int64) uint16 {
+	if sectors := (size + 511) / 512; sectors <= 0xFFFF {
+		return uint16(sectors)
+	}
+	return 0
 }
 
 // BootInfoTableChecksum computes the El Torito Boot Information Table's

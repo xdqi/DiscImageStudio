@@ -49,7 +49,7 @@ an x86 legacy BIOS entry: no-emulation, a Boot Information Table patched into
 bytes 8..55 of its on-disc content, and the load size rounded up to 2 KiB —
 the BIOS entry always appears before the EFI one; both may be given. Boot
 paths are relative to `--data-dir` and appear at the same path in both
-filesystems.
+filesystems. An EFI image over 32 MiB is recorded with load size 0, as xorriso does.
 Repeat `--expose PATH` to expose other files or directories recursively;
 their parent directories are included. Exposed files and boot images occupy
 continuous extents shared with UDF. Joliet-long preserves names up to 103

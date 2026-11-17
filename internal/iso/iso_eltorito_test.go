@@ -564,3 +564,27 @@ func TestBootInfoTableChecksum(t *testing.T) {
 		t.Fatalf("short/zero checksum = %#x, want 0", got)
 	}
 }
+
+// TestElToritoBridgeLargeEfiImage: an EFI image over 32 MiB (archiso's ESP
+// carries the kernel and initramfs) does not fit the 16-bit sector count;
+// the catalog records 0 like xorriso, instead of a truncated count.
+func TestElToritoBridgeLargeEfiImage(t *testing.T) {
+	const size = 114294784 // archlinux-2026.11.01's El Torito EFI image
+	bridge, err := NewElToritoBridge(200000, "TEST", "efiboot.img", size, "", 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.SetPlacements(300, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	catalog := mustBridgeSector(t, bridge, bridge.CatalogLba())
+	if got := binary.LittleEndian.Uint16(catalog[38:40]); got != 0 {
+		t.Fatalf("EFI sector count = %d, want 0 for an image over 32 MiB", got)
+	}
+	if got := binary.LittleEndian.Uint32(catalog[40:44]); got != 300 {
+		t.Fatalf("EFI image LBA = %d, want 300", got)
+	}
+	if efiLoadSectors(0xFFFF*512) != 0xFFFF || efiLoadSectors(0xFFFF*512+1) != 0 {
+		t.Fatal("efiLoadSectors must switch to 0 just past 0xFFFF sectors")
+	}
+}
