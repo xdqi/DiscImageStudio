@@ -168,6 +168,20 @@ type isoNode struct {
 	timestamp             time.Time
 	isSymlink             bool
 	linkTarget            string
+	// Full-tree bridge only (iso_bridge_full.go): the file's sections (one
+	// directory record each, multi-extent when more than one), the source
+	// permission bits for the Rock Ridge PX entry, and the dispersed UDF
+	// plan's file index (-1 for directories and the boot catalog).
+	sections  []isoSection
+	mode      uint32
+	fileIndex int
+}
+
+// isoSection is one ISO9660 file section: a contiguous extent recorded by its
+// own directory record.
+type isoSection struct {
+	lba    uint32
+	length uint32
 }
 
 // isoLayout ports Iso9660ImageWriter.Layout.

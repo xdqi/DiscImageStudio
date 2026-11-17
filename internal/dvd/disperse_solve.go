@@ -14,7 +14,8 @@ import (
 // the data goes (mid-tone areas and flat interiors render gray = data), and
 // UDF's fragmentable extents pour the files into those sectors.
 
-// solveDispersedUdf ports the new `solve --filesystem udf|udf-bridge` path.
+// solveDispersedUdf ports the new `solve --filesystem udf|udf-bridge` path
+// and adds udf-full.
 func solveDispersedUdf(arguments *cliArguments) error {
 	imagePath, err := arguments.Require("image")
 	if err != nil {
@@ -29,23 +30,28 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		return err
 	}
 	filesystem := strings.ToLower(arguments.Get("filesystem", "udf"))
-	bridge := filesystem == "udf-bridge"
+	// udf-bridge adds an ISO9660 + El Torito bridge listing the boot images
+	// and the --expose paths; udf-full lists the whole tree on it (multi-
+	// extent files share UDF's fragments), --expose then naming the files
+	// that must stay contiguous (those GRUB and isolinux read).
+	bridge := filesystem == "udf-bridge" || filesystem == "udf-full"
+	fullTree := filesystem == "udf-full"
 	if filesystem != "udf" && !bridge {
-		return newArgumentError("--filesystem must be udf or udf-bridge.")
+		return newArgumentError("--filesystem must be udf, udf-bridge or udf-full.")
 	}
 	var bootImagePath, legacyBootImagePath string
 	if bridge {
 		bootImagePath = arguments.Get("boot-image", "")
 		legacyBootImagePath = arguments.Get("legacy-boot-image", "")
 		if bootImagePath == "" && legacyBootImagePath == "" {
-			return newArgumentError("--filesystem udf-bridge requires --boot-image or --legacy-boot-image.")
+			return newArgumentError("--filesystem udf-bridge and udf-full require --boot-image or --legacy-boot-image.")
 		}
 	} else if arguments.Has("boot-image") || arguments.Has("legacy-boot-image") {
-		return newArgumentError("--boot-image and --legacy-boot-image require --filesystem udf-bridge.")
+		return newArgumentError("--boot-image and --legacy-boot-image require --filesystem udf-bridge or udf-full.")
 	}
 	exposePaths := arguments.GetAll("expose")
 	if len(exposePaths) > 0 && !bridge {
-		return newArgumentError("--expose requires --filesystem udf-bridge.")
+		return newArgumentError("--expose requires --filesystem udf-bridge or udf-full.")
 	}
 	volumeLabel := arguments.Get("volume-label", "DVD_IMAGE")
 
@@ -157,10 +163,17 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		if legacyBootImageIndex >= 0 {
 			legacyBootImageSize = udfPlan.FileSize(legacyBootImageIndex)
 		}
-		bridgeLayer, err = iso.NewElToritoBridge(totalSectors, volumeLabel,
-			strings.ReplaceAll(bootImagePath, "\\", "/"), bootImageSize,
-			strings.ReplaceAll(legacyBootImagePath, "\\", "/"), legacyBootImageSize,
-			exposed, extraDirs)
+		if fullTree {
+			bridgeLayer, err = iso.NewElToritoBridgeFull(totalSectors, volumeLabel,
+				strings.ReplaceAll(bootImagePath, "\\", "/"), bootImageSize,
+				strings.ReplaceAll(legacyBootImagePath, "\\", "/"), legacyBootImageSize,
+				udfPlan.BridgeTree())
+		} else {
+			bridgeLayer, err = iso.NewElToritoBridge(totalSectors, volumeLabel,
+				strings.ReplaceAll(bootImagePath, "\\", "/"), bootImageSize,
+				strings.ReplaceAll(legacyBootImagePath, "\\", "/"), legacyBootImageSize,
+				exposed, extraDirs)
+		}
 		if err != nil {
 			return err
 		}
@@ -224,7 +237,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		filePaths[i] = udfPlan.FileSourcePath(i)
 	}
 
-	plan, err := planDispersion(dispersePlannerInputs{
+	plannerInputs := dispersePlannerInputs{
 		totalSectors:   totalSectors,
 		fixed:          toDataConstraints(fixed),
 		continuous:     continuous,
@@ -237,7 +250,19 @@ func solveDispersedUdf(arguments *cliArguments) error {
 		toneMap:        toneMap,
 		reservedBefore: metaEnd,
 		reservedAfter:  totalSectors - iso.UdfReserveTailSectors,
-	})
+	}
+	// treeEnd is the end of the inner metadata region: the UDF partition
+	// metadata, plus — for a full-tree bridge — the ISO9660 tree reserved
+	// right after it.
+	treeEnd := metaEnd
+	var treeSectors uint32
+	var plan *dispersePlan
+	if fullTree {
+		plan, treeSectors, err = planFullTreeDispersion(plannerInputs, fixed, bridgeLayer, metaEnd)
+		treeEnd = metaEnd + treeSectors
+	} else {
+		plan, err = planDispersion(plannerInputs)
+	}
 	if err != nil {
 		return err
 	}
@@ -271,18 +296,12 @@ func solveDispersedUdf(arguments *cliArguments) error {
 				bootLba = legacyLba
 			}
 		}
-		exposedLbas := make([]uint32, len(exposed))
-		for i := range exposed {
-			if exposed[i].Size == 0 {
-				continue // empty file: no extent (ISO9660 record LBA 0)
+		if fullTree {
+			// Every file's ISO9660 sections are its UDF extents.
+			if err := bridgeLayer.SetFullPlacements(metaEnd, treeSectors, bootLba, legacyLba, udfExtents); err != nil {
+				return err
 			}
-			lba, ok := byRole["iso-expose/"+exposed[i].Path]
-			if !ok {
-				return fmt.Errorf("internal: no placement for exposed file %s", exposed[i].Path)
-			}
-			exposedLbas[i] = lba
-		}
-		if err := bridgeLayer.SetPlacements(bootLba, legacyLba, exposedLbas); err != nil {
+		} else if err := setExposedPlacements(bridgeLayer, byRole, exposed, bootLba, legacyLba); err != nil {
 			return err
 		}
 	}
@@ -301,7 +320,7 @@ func solveDispersedUdf(arguments *cliArguments) error {
 			return data, ok
 		},
 		gray:       plan.eligible,
-		grayBefore: metaEnd,
+		grayBefore: treeEnd,
 		grayFrom:   totalSectors - iso.UdfReserveTailSectors,
 		readFileContent: func(fileIndex int, offset int64, buf []byte) error {
 			content, ok, err := udfPlan.FileContent(fileIndex)
@@ -400,22 +419,94 @@ func solveDispersedUdf(arguments *cliArguments) error {
 	fmt.Println()
 
 	if err := maybeRenderUsageMap(arguments, imageMapping,
-		classifyDispersedSectors(totalSectors, metaEnd, plan.eligible, extents), &plan.band); err != nil {
+		classifyDispersedSectors(totalSectors, treeEnd, plan.eligible, extents), &plan.band); err != nil {
 		return err
 	}
 
 	resolvedBand := [2]int{int(plan.band[0]), int(plan.band[1])}
-	if err := writeDisperseSidecar(isoOutputPath, plan, udfPlan, bridgeLayer != nil, resolvedBand, plan.marginWhite, plan.marginBlack); err != nil {
+	if err := writeDisperseSidecar(isoOutputPath, plan, udfPlan, filesystem, resolvedBand, plan.marginWhite, plan.marginBlack); err != nil {
 		return err
 	}
 	headroomNote := ""
 	if plan.headroom != headroom {
 		headroomNote = fmt.Sprintf(", headroom relaxed to %.2f", plan.headroom)
 	}
-	fmt.Printf("done: dispersed UDF %s, files=%d, gray band=[%d,%d]%s, output=%s\n",
-		filesystem, udfPlan.FileCount(), plan.band[0], plan.band[1], headroomNote, isoOutputPath)
+	treeNote := ""
+	if fullTree {
+		multiExtent := 0
+		for _, list := range plan.fileExtents {
+			if len(list) > 1 {
+				multiExtent++
+			}
+		}
+		treeNote = fmt.Sprintf(", ISO9660 full tree (%d sectors, %d multi-extent files)", treeSectors, multiExtent)
+	}
+	fmt.Printf("done: dispersed UDF %s, files=%d, gray band=[%d,%d]%s%s, output=%s\n",
+		filesystem, udfPlan.FileCount(), plan.band[0], plan.band[1], headroomNote, treeNote, isoOutputPath)
 	_ = summary
 	return nil
+}
+
+// setExposedPlacements hands an exposed-mode bridge its boot image LBAs and
+// the planner-assigned LBA of every exposed file.
+func setExposedPlacements(bridgeLayer *iso.ElToritoBridge, byRole map[string]uint32, exposed []iso.ExposedFile,
+	bootLba, legacyLba uint32) error {
+	exposedLbas := make([]uint32, len(exposed))
+	for i := range exposed {
+		if exposed[i].Size == 0 {
+			continue // empty file: no extent (ISO9660 record LBA 0)
+		}
+		lba, ok := byRole["iso-expose/"+exposed[i].Path]
+		if !ok {
+			return fmt.Errorf("internal: no placement for exposed file %s", exposed[i].Path)
+		}
+		exposedLbas[i] = lba
+	}
+	return bridgeLayer.SetPlacements(bootLba, legacyLba, exposedLbas)
+}
+
+// planFullTreeDispersion plans a full-tree bridge disc. The ISO9660 tree is
+// reserved right after the UDF metadata, but its size depends on how many
+// sections the planner splits each file into; so plan with a reserve sized
+// for the current estimate, recount, and replan with a larger reserve until
+// the tree fits. Every file is also capped at iso.IsoLinuxMaxSections.
+func planFullTreeDispersion(in dispersePlannerInputs, fixed []isoConstraint, bridgeLayer *iso.ElToritoBridge,
+	metaEnd uint32) (*dispersePlan, uint32, error) {
+	in.maxIsoSections = iso.IsoLinuxMaxSections
+	slack := func(need uint32) uint32 { return need + max(16, need/8) }
+	need, err := bridgeLayer.FullTreeSectors(nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	reserve := slack(need)
+	for attempt := 0; ; attempt++ {
+		if uint64(metaEnd)+uint64(reserve) >= uint64(in.reservedAfter) {
+			return nil, 0, fmt.Errorf("the ISO9660 tree needs %d sectors, more than the disc holds", reserve)
+		}
+		at := metaEnd
+		withTree := append(append([]isoConstraint(nil), fixed...),
+			isoConstraint{role: "iso9660-tree", length: reserve, fixedAt: &at})
+		in.fixed = toDataConstraints(withTree)
+		in.reservedBefore = metaEnd + reserve
+		plan, err := planDispersion(in)
+		if err != nil {
+			return nil, 0, err
+		}
+		counts := make(map[int]int, len(plan.fileExtents))
+		for fileIndex, extents := range plan.fileExtents {
+			counts[fileIndex] = isoSectionCount(extents)
+		}
+		if need, err = bridgeLayer.FullTreeSectors(counts); err != nil {
+			return nil, 0, err
+		}
+		if need <= reserve {
+			return plan, reserve, nil
+		}
+		if attempt >= 8 {
+			return nil, 0, fmt.Errorf("internal: the ISO9660 tree (%d sectors) keeps outgrowing its reserve (%d)", need, reserve)
+		}
+		reserve = slack(need)
+	}
 }
 
 // isoConstraint is the local constraint record before conversion.

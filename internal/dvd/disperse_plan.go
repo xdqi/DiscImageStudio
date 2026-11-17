@@ -64,6 +64,10 @@ type dispersePlannerInputs struct {
 	toneMap        *disperseToneMap
 	reservedBefore uint32 // [0, reservedBefore) is never picture/data-placement
 	reservedAfter  uint32 // [reservedAfter, totalSectors) is never picture/placement
+	// maxIsoSections, when > 0, caps each file's ISO9660 file sections (a
+	// full-tree bridge lists every fragment as one section; the Linux isofs
+	// driver follows at most iso.IsoLinuxMaxSections).
+	maxIsoSections int
 }
 
 type continuousDemand struct {
@@ -182,8 +186,8 @@ func planDispersion(in dispersePlannerInputs) (*dispersePlan, error) {
 			continue
 		}
 		if tooMany, ok := placementErr.(*tooManyExtentsError); ok {
-			return nil, fmt.Errorf("the picture's gray areas are too scattered for %s: it needs %d UDF allocation descriptors, but one file entry supports %d; use a picture with larger mid-tone or flat areas, or fewer files",
-				tooMany.path, tooMany.extents, iso.UdfMaxAllocationDescriptors)
+			return nil, fmt.Errorf("the picture's gray areas are too scattered for %s: it needs %d %s, but %s; use a picture with larger mid-tone or flat areas, or fewer files",
+				tooMany.path, tooMany.extents, tooMany.unit(), tooMany.limitText())
 		}
 		return nil, fmt.Errorf("the picture's mid-tone and flat areas hold %d sectors, but the data alone needs %d; use a picture with more tonal range or fewer files", count, needed)
 	}
@@ -195,16 +199,32 @@ type noContinuousRunError struct{ msg string }
 func (e *noContinuousRunError) Error() string { return e.msg }
 
 // tooManyExtentsError reports a file whose placement needs more UDF
-// allocation descriptors than one file entry holds. It is retryable: a wider
-// gray band merges and lengthens the free runs, reducing fragmentation.
+// allocation descriptors than one file entry holds — or, with isoLimit > 0,
+// more ISO9660 file sections than the full-tree bridge allows. It is
+// retryable: a wider gray band merges and lengthens the free runs, reducing
+// fragmentation.
 type tooManyExtentsError struct {
-	path    string
-	extents int
+	path     string
+	extents  int
+	isoLimit int // > 0: the ISO9660 section limit was exceeded
+}
+
+func (e *tooManyExtentsError) unit() string {
+	if e.isoLimit > 0 {
+		return "ISO9660 file sections"
+	}
+	return "UDF allocation descriptors"
+}
+
+func (e *tooManyExtentsError) limitText() string {
+	if e.isoLimit > 0 {
+		return fmt.Sprintf("Linux reads at most %d sections per file", e.isoLimit)
+	}
+	return fmt.Sprintf("one file entry supports %d", iso.UdfMaxAllocationDescriptors)
 }
 
 func (e *tooManyExtentsError) Error() string {
-	return fmt.Sprintf("%s needs %d UDF allocation descriptors (one file entry supports %d)",
-		e.path, e.extents, iso.UdfMaxAllocationDescriptors)
+	return fmt.Sprintf("%s needs %d %s (%s)", e.path, e.extents, e.unit(), e.limitText())
 }
 
 // placeDispersion assigns every constraint a final position: fixed extents
@@ -298,15 +318,41 @@ func placeDispersion(in dispersePlannerInputs, eligible []bool, fixedUsed []bool
 			worstIndex, worstDescriptors = fileIndex, descriptors
 		}
 	}
-	if worstDescriptors > iso.UdfMaxAllocationDescriptors {
-		path := in.filePaths[worstIndex]
-		if path == "" {
-			path = fmt.Sprintf("file #%d", worstIndex)
+	label := func(index int) string {
+		if path := in.filePaths[index]; path != "" {
+			return path
 		}
-		return nil, &tooManyExtentsError{path: path, extents: worstDescriptors}
+		return fmt.Sprintf("file #%d", index)
+	}
+	if worstDescriptors > iso.UdfMaxAllocationDescriptors {
+		return nil, &tooManyExtentsError{path: label(worstIndex), extents: worstDescriptors}
+	}
+	// The full-tree bridge lists every fragment as ISO9660 file sections
+	// (split at iso.IsoMaxSectionBytes).
+	if in.maxIsoSections > 0 {
+		worstIndex, worstSections := -1, 0
+		for fileIndex := range in.fileSizes {
+			if sections := isoSectionCount(plan.fileExtents[fileIndex]); sections > worstSections {
+				worstIndex, worstSections = fileIndex, sections
+			}
+		}
+		if worstSections > in.maxIsoSections {
+			return nil, &tooManyExtentsError{path: label(worstIndex), extents: worstSections, isoLimit: in.maxIsoSections}
+		}
 	}
 	plan.constraints = in.fixed
 	return plan, nil
+}
+
+// isoSectionCount is how many ISO9660 file sections a file's fragments
+// become: one per fragment, split at iso.IsoMaxSectionBytes.
+func isoSectionCount(extents []fileExtent) int {
+	sections := 0
+	for _, e := range extents {
+		cover := uint64(e.sectors) * 2048
+		sections += int((cover + iso.IsoMaxSectionBytes - 1) / iso.IsoMaxSectionBytes)
+	}
+	return sections
 }
 
 func findFreeRun(used, eligible []bool, sectors uint32) (uint32, bool) {

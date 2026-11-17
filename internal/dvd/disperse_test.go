@@ -1112,3 +1112,162 @@ func TestDispersedUdfBridgeBothBootImages(t *testing.T) {
 		t.Fatalf("the BIOS (legacy) entry must appear before the UEFI one:\n%s", text)
 	}
 }
+
+// TestPlaceDispersionIsoSectionLimit: with a full-tree bridge, a file may
+// not need more ISO9660 sections than Linux follows, even when UDF's own
+// allocation-descriptor limit is still met.
+func TestPlaceDispersionIsoSectionLimit(t *testing.T) {
+	const total = 4096
+	eligible := make([]bool, total)
+	for i := 100; i < 200; i++ { // one 100-sector run
+		eligible[i] = true
+	}
+	for k := 0; k < 120; k++ { // 120 single-sector runs
+		eligible[1000+2*k] = true
+	}
+	in := dispersePlannerInputs{
+		totalSectors: total,
+		fileSizes:    []int64{200 * 2048},
+		filePaths:    []string{"big.bin"},
+	}
+	if _, err := placeDispersion(in, eligible, make([]bool, total)); err != nil {
+		t.Fatalf("101 fragments fit UDF's descriptor limit: %v", err)
+	}
+	in.maxIsoSections = iso.IsoLinuxMaxSections
+	_, err := placeDispersion(in, eligible, make([]bool, total))
+	tooMany, ok := err.(*tooManyExtentsError)
+	if !ok {
+		t.Fatalf("error = %v (%T), want *tooManyExtentsError", err, err)
+	}
+	if tooMany.path != "big.bin" || tooMany.extents != 101 || tooMany.isoLimit != iso.IsoLinuxMaxSections {
+		t.Fatalf("tooManyExtentsError = %+v, want big.bin/101 sections over the ISO limit", tooMany)
+	}
+	if !strings.Contains(err.Error(), "ISO9660 file sections") {
+		t.Fatalf("error %q should name the ISO9660 limit", err)
+	}
+}
+
+// TestDispersedUdfBridgeFullTreeEndToEnd: --filesystem udf-full lists every
+// file, directory and symlink on the ISO9660 side (Rock Ridge), each file at
+// the same extents as its UDF file entry; --expose keeps files contiguous.
+func TestDispersedUdfBridgeFullTreeEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	pngPath := writeGradientPng(t, filepath.Join(dir, "gradient.png"), 64)
+	dataDir := filepath.Join(dir, "data")
+	files := map[string][]byte{
+		"boot/loader.bin": bytes.Repeat([]byte{0x5A}, 4096),
+		".disk/info":      []byte("full tree\n"),
+		"a/foo":           []byte("not exposed, still listed\n"),
+		"a/b/barz":        bytes.Repeat([]byte("barz"), 5000),
+		"a/empty":         nil,
+		"Long Name With Spaces and Unicode é.txt": []byte("rock ridge name\n"),
+	}
+	for name, content := range files {
+		path := filepath.Join(dataDir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, content, 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "emptydir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("barz", filepath.Join(dataDir, "a", "b", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	isoPath := filepath.Join(dir, "disc.iso")
+	code := RunCommand([]string{
+		"solve", "--image", pngPath, "--iso-output", isoPath,
+		"--total-sectors", "4096", "--data-dir", dataDir,
+		"--filesystem", "udf-full",
+		"--boot-image", "boot/loader.bin", "--expose", ".disk",
+	})
+	if code != 0 {
+		t.Fatalf("solve exited %d", code)
+	}
+	data, err := os.ReadFile(isoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The primary tree lists everything; /A/B/BARZ;1 sits at barz's UDF
+	// extent.
+	pvd := data[16*2048:]
+	root := parseIso9660DirRecords(t, data, binary.LittleEndian.Uint32(pvd[158:162]), binary.LittleEndian.Uint32(pvd[166:170]))
+	byName := map[string]iso9660TestRecord{}
+	for _, r := range root {
+		byName[r.name] = r
+	}
+	for _, name := range []string{"A", "BOOT", "DISK", "EMPTYDIR", "BOOT.CAT;1"} {
+		if _, ok := byName[name]; !ok {
+			t.Fatalf("ISO9660 root lacks %s: %v", name, root)
+		}
+	}
+	dirB := iso9660TestRecord{}
+	for _, r := range parseIso9660DirRecords(t, data, byName["A"].lba, byName["A"].size) {
+		if r.name == "B" {
+			dirB = r
+		}
+	}
+	// Every ISO9660 section of barz is the matching UDF allocation
+	// descriptor (same LBA, same length), in content order; the multi-extent
+	// flag marks all but the last.
+	var barz []iso9660TestRecord
+	for _, r := range parseIso9660DirRecords(t, data, dirB.lba, dirB.size) {
+		if r.name == "BARZ;1" {
+			barz = append(barz, r)
+		}
+	}
+	v := newUdfTestVolume(t, data)
+	fe := v.findFileEntry("barz")
+	if fe == nil || len(barz) == 0 {
+		t.Fatalf("barz missing (UDF %v, ISO %d records)", fe != nil, len(barz))
+	}
+	_, udfExtents := v.extents(fe)
+	if len(udfExtents) != 2*len(barz) {
+		t.Fatalf("barz: %d ISO9660 sections for %d UDF extents", len(barz), len(udfExtents)/2)
+	}
+	for i, r := range barz {
+		lba, length := v.partitionStart+udfExtents[2*i], udfExtents[2*i+1]
+		if uint64(r.lba) != lba || uint64(r.size) != length {
+			t.Fatalf("barz section %d: ISO9660 %d/%d, UDF %d/%d", i, r.lba, r.size, lba, length)
+		}
+		if last := i == len(barz)-1; (r.flags&0x80 != 0) == last {
+			t.Fatalf("barz section %d: multi-extent flag %#x", i, r.flags)
+		}
+	}
+
+	sidecar, err := os.ReadFile(isoPath + ".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(sidecar, []byte(`"filesystem": "udf-full"`)) || !bytes.Contains(sidecar, []byte(`"iso9660-tree"`)) {
+		t.Fatalf("sidecar lacks the full-tree records:\n%s", sidecar)
+	}
+
+	xorriso, err := exec.LookPath("xorriso")
+	if err != nil {
+		t.Skip("xorriso not installed")
+	}
+	for name, want := range files {
+		dest := filepath.Join(t.TempDir(), "out")
+		if output, err := exec.Command(xorriso, "-osirrox", "on", "-indev", isoPath, "-extract", "/"+name, dest).CombinedOutput(); err != nil {
+			t.Fatalf("xorriso extract %s: %v\n%s", name, err, output)
+		}
+		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("xorriso extract %s: content mismatch (%v)", name, err)
+		}
+	}
+	output, err := exec.Command(xorriso, "-indev", isoPath, "-lsdl", "/a/b/link", "/a/foo", "/emptydir").CombinedOutput()
+	if err != nil {
+		t.Fatalf("xorriso -lsdl: %v\n%s", err, output)
+	}
+	for _, want := range []string{"'/a/b/link' -> 'barz'", "-rw-r-----", "'/emptydir'"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("xorriso -lsdl output lacks %q:\n%s", want, output)
+		}
+	}
+}

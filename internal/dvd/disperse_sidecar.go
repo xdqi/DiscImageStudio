@@ -40,12 +40,8 @@ type disperseSidecar struct {
 	Files            []sidecarFilePlacement `json:"files"`
 }
 
-func writeDisperseSidecar(isoPath string, plan *dispersePlan, udfPlan *iso.UdfDispersedPlan, bridge bool,
+func writeDisperseSidecar(isoPath string, plan *dispersePlan, udfPlan *iso.UdfDispersedPlan, filesystem string,
 	band [2]int, marginWhite, marginBlack float64) error {
-	filesystem := "udf"
-	if bridge {
-		filesystem = "udf-bridge"
-	}
 	var constraints []sidecarConstraint
 	for _, c := range plan.constraints {
 		constraints = append(constraints, sidecarConstraint{

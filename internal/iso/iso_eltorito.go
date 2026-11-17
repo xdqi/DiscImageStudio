@@ -77,6 +77,19 @@ type ElToritoBridge struct {
 	legacyBootLba uint32 // x86 legacy BIOS image extent
 	placementsSet bool
 	sectors       map[uint32][]byte
+
+	// Full-tree mode (NewElToritoBridgeFull, iso_bridge_full.go): every
+	// node of the data tree is listed, with Rock Ridge, multi-extent files
+	// and the tree laid out in [treeStartLba, treeEndLba) after the UDF
+	// metadata instead of in sectors 50..255.
+	fullTree              bool
+	fileNodes             map[int]*isoNode // dispersed UDF file index → regular file node
+	pathTableLba          uint32           // primary L path table (full tree)
+	bigPathTableLba       uint32           // primary M path table (full tree)
+	jolietBigPathTableLba uint32           // Joliet M path table (full tree)
+	treeStartLba          uint32
+	treeEndLba            uint32
+	rockRidgeSerials      map[*isoNode]uint32
 }
 
 // NewElToritoBridge creates the layer. volumeSectors is the total image size
@@ -91,32 +104,8 @@ type ElToritoBridge struct {
 // convention (time.Now().UTC()).
 func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName string, bootImageSize int64,
 	legacyBootImagePath string, legacyBootImageSize int64, exposed []ExposedFile, extraDirs []string) (*ElToritoBridge, error) {
-	if volumeSectors <= 25 {
-		return nil, fmt.Errorf("UDF bridge volume of %d sectors is too small for the ISO9660/El Torito layer (sectors through %d). (Parameter 'volumeSectors')",
-			volumeSectors, 25)
-	}
-	checkBootImage := func(path string, size int64, param string) error {
-		if path == "" {
-			return nil
-		}
-		if size <= 0 || size > maxBootImageBytes {
-			return fmt.Errorf("Boot image size must be between 1 byte and %d. (Parameter '%s')",
-				maxBootImageBytes, param)
-		}
-		if normalizePrimaryIdentifier(path, maximumPrimaryIdentifierCharacters-2, "") == "" {
-			return fmt.Errorf("Boot image path does not normalize to an ISO9660 primary identifier: %s (Parameter '%s')",
-				path, param)
-		}
-		return nil
-	}
-	if err := checkBootImage(bootImageName, bootImageSize, "bootImageName"); err != nil {
+	if err := validateBridgeBootImages(volumeSectors, bootImageName, bootImageSize, legacyBootImagePath, legacyBootImageSize); err != nil {
 		return nil, err
-	}
-	if err := checkBootImage(legacyBootImagePath, legacyBootImageSize, "legacyBootImagePath"); err != nil {
-		return nil, err
-	}
-	if bootImageName == "" && legacyBootImagePath == "" {
-		return nil, errors.New("The bridge needs at least one boot image (EFI or x86 legacy BIOS).")
 	}
 	b := &ElToritoBridge{
 		volumeSectors: volumeSectors,
@@ -278,11 +267,48 @@ func NewElToritoBridge(volumeSectors uint32, volumeLabel string, bootImageName s
 	return b, nil
 }
 
+// validateBridgeBootImages checks the volume size and the boot image
+// arguments shared by both bridge constructors.
+func validateBridgeBootImages(volumeSectors uint32, bootImageName string, bootImageSize int64,
+	legacyBootImagePath string, legacyBootImageSize int64) error {
+	if volumeSectors <= 25 {
+		return fmt.Errorf("UDF bridge volume of %d sectors is too small for the ISO9660/El Torito layer (sectors through %d). (Parameter 'volumeSectors')",
+			volumeSectors, 25)
+	}
+	checkBootImage := func(path string, size int64, param string) error {
+		if path == "" {
+			return nil
+		}
+		if size <= 0 || size > maxBootImageBytes {
+			return fmt.Errorf("Boot image size must be between 1 byte and %d. (Parameter '%s')",
+				maxBootImageBytes, param)
+		}
+		if normalizePrimaryIdentifier(path, maximumPrimaryIdentifierCharacters-2, "") == "" {
+			return fmt.Errorf("Boot image path does not normalize to an ISO9660 primary identifier: %s (Parameter '%s')",
+				path, param)
+		}
+		return nil
+	}
+	if err := checkBootImage(bootImageName, bootImageSize, "bootImageName"); err != nil {
+		return err
+	}
+	if err := checkBootImage(legacyBootImagePath, legacyBootImageSize, "legacyBootImagePath"); err != nil {
+		return err
+	}
+	if bootImageName == "" && legacyBootImagePath == "" {
+		return errors.New("The bridge needs at least one boot image (EFI or x86 legacy BIOS).")
+	}
+	return nil
+}
+
 // SetPlacements records the planner-assigned LBAs of the boot images and the
 // exposed files (in the constructor's order) and renders the layer's
 // sectors. Every file's extent must be contiguous. Absent boot images take
 // LBA 0.
 func (b *ElToritoBridge) SetPlacements(bootImageLba uint32, legacyBootImageLba uint32, exposedLbas []uint32) error {
+	if b.fullTree {
+		return errors.New("A full-tree bridge is placed with SetFullPlacements.")
+	}
 	if len(exposedLbas) != len(b.exposedNodes) {
 		return fmt.Errorf("Got %d exposed-file LBAs for %d exposed files. (Parameter 'exposedLbas')",
 			len(exposedLbas), len(b.exposedNodes))
@@ -337,13 +363,18 @@ func (b *ElToritoBridge) checkPlacement(lba uint32, param string) error {
 }
 
 // MetadataExtents lists every sector this layer owns (for the planner's
-// fixed constraints and the sidecar report).
+// fixed constraints and the sidecar report). A full-tree bridge lists only
+// the volume descriptors at 16..19: its tree occupies the region the caller
+// reserves and passes to SetFullPlacements.
 func (b *ElToritoBridge) MetadataExtents() []BridgeMetadataExtent {
 	out := []BridgeMetadataExtent{
 		{Role: "iso9660-pvd", Lba: primaryVolumeDescriptorLba},
 		{Role: "el-torito-record", Lba: bridgeBootRecordLba},
 		{Role: "joliet-svd", Lba: bridgeSupplementaryLba},
 		{Role: "iso9660-terminator", Lba: bridgeTerminatorLba},
+	}
+	if b.fullTree {
+		return out
 	}
 	for i := uint32(0); i < b.jolietPathTableSectors; i++ {
 		out = append(out, BridgeMetadataExtent{Role: "joliet-pathtable", Lba: b.jolietPathTableLba + i})

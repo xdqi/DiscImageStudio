@@ -20,11 +20,14 @@ providing the same 12 commands with byte-identical output files:
   no desktop app or .NET runtime needed. See
   [Calibration (browser UI)](#calibration-browser-ui).
 - **A picture disc can carry actual data mixed into the image**
-  (`solve --filesystem udf|udf-bridge`): the files of a `--data-dir` tree are
+  (`solve --filesystem udf|udf-bridge|udf-full`): the files of a `--data-dir` tree are
   dispersed into the picture's gray areas as a UDF filesystem — the burned
   disc shows the image *and* mounts as a normal data disc — optionally with an
-  ISO9660/Joliet + El Torito bridge so it also boots (BIOS and EFI). See
-  [Dispersed hybrid discs (DVD)](#dispersed-hybrid-discs-dvd). For a complete
+  ISO9660/Joliet + El Torito bridge so it also boots (BIOS and EFI). With
+  `--filesystem udf-full` the ISO9660 side lists the whole tree too
+  (fragmented files as multi-extent records), so ISO9660-only software such as
+  the Debian installer reads the disc unmodified (boot such discs directly).
+  See [Dispersed hybrid discs (DVD)](#dispersed-hybrid-discs-dvd). For a complete
   worked example — turning a Debian installer ISO into a bootable picture
   disc — see [`examples/debian`](examples/debian).
 
@@ -55,6 +58,50 @@ their parent directories are included. Exposed files and boot images occupy
 continuous extents shared with UDF. Joliet-long preserves names up to 103
 UTF-16 code units; the primary ISO9660 view uses normalized names. Names that
 cannot be represented in Joliet are rejected rather than renamed.
+
+### Full ISO9660 tree (`--filesystem udf-full`)
+
+With `udf-bridge` the ISO9660 side lists only the boot images and the
+`--expose` paths, so software that reads ISO9660 only — GRUB's built-in
+driver, `mount -t iso9660`, debian-installer's `cdrom-detect` — sees just
+those files. `udf-full` takes the same options and lists every file,
+directory and symlink there as well, with Rock Ridge (exact names, permission bits,
+symlinks) and a Joliet-long tree. File data is still stored once: each
+ISO9660 file points at the same extents as its UDF file entry, and a file the
+planner fragmented becomes a multi-extent file (ECMA-119 file sections, one
+directory record per fragment). The tree is laid out right after the UDF
+metadata; the planner caps every file at 100 sections (the Linux isofs limit)
+and widens the gray band when a file would need more. The volume label is
+written verbatim into the ISO9660 descriptors when it is printable ASCII of
+at most 32 bytes (lookups such as `root=live:CDLABEL=` compare it exactly);
+otherwise it is normalized like with `udf-bridge`.
+
+The sections of a multi-extent file are generally not adjacent on the disc.
+ECMA-119 allows that, but every common mastering tool writes them adjacent,
+and some readers rely on it (measured with non-adjacent, out-of-order
+sections):
+
+| Reader | Non-adjacent multi-extent files |
+| ------ | ------------------------------- |
+| BIOS / UEFI firmware | not involved: El Torito loads the boot images by LBA |
+| Linux kernel (`iso9660`) | read correctly, up to 100 sections per file |
+| 7-Zip, xorriso (libisofs) | read correctly |
+| GRUB 2.14 | misreads: a read starting inside a section runs past its end |
+| syslinux / isolinux | single-extent files only |
+| libarchive (bsdtar) | misreads (reads the sections as if adjacent) |
+| Windows, macOS | not tested; they normally mount the UDF side of a bridge disc |
+
+So name everything the boot loaders read with `--expose` — with `udf-full`
+it only keeps those files contiguous (single-section). For a Debian installer
+that is `.disk EFI boot install.amd isolinux`; the rest (`pool/`, `dists/`,
+...) is read by the Linux kernel.
+
+**Boot a `udf-full` disc directly.** Burn the image and let the firmware
+boot the disc through El Torito. Booting the image through a boot loader
+that reads it as an ISO9660 file system — GRUB `loopback`, Ventoy, syslinux
+`memdisk` and the like — is not supported, as those readers misread files
+split into non-adjacent sections. Nor does the image boot from a USB stick:
+it carries no isohybrid MBR/GPT.
 
 Knobs: `--gray-band T1:T2` (manual luminance band; default widens from
 120:136 until capacity fits), `--interior-margin`/`--interior-margin-black`

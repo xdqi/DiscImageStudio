@@ -398,6 +398,39 @@ func (p *UdfDispersedPlan) WalkExposure(path string) (files []ExposureFile, dirs
 	return files, dirs, true
 }
 
+// BridgeTree lists the whole volume tree for a full-tree ISO9660 bridge
+// (NewElToritoBridgeFull): the root first, then every node in the plan's
+// enumeration order (parents before children), with the file indexes of
+// regular files and symlinks.
+func (p *UdfDispersedPlan) BridgeTree() []BridgeTreeEntry {
+	index := make(map[*udfNode]int, len(p.files))
+	for i, file := range p.files {
+		index[file] = i
+	}
+	root := p.layout.nodes[0]
+	paths := map[*udfNode]string{root: ""}
+	tree := []BridgeTreeEntry{{IsDirectory: true, Mode: root.mode, ModTime: root.timestamp, FileIndex: -1}}
+	for _, node := range p.layout.nodes[1:] {
+		path := node.name
+		if parentPath := paths[node.parent]; parentPath != "" {
+			path = parentPath + "/" + node.name
+		}
+		paths[node] = path
+		entry := BridgeTreeEntry{
+			Path: path, IsDirectory: node.isDirectory, IsSymlink: node.isSymlink, LinkTarget: node.linkTarget,
+			Mode: node.mode, ModTime: node.timestamp, FileIndex: -1,
+		}
+		if !node.isDirectory {
+			entry.FileIndex = index[node]
+			if !node.isSymlink {
+				entry.Size = node.dataLength
+			}
+		}
+		tree = append(tree, entry)
+	}
+	return tree
+}
+
 // FilePath returns the image-root-relative path of file index (e.g.
 // "pool/main/a/aaa.deb"); FileName returns only the basename, which is not
 // unique across the tree.
