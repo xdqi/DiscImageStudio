@@ -1,10 +1,10 @@
 # Debian installer → picture hybrid disc
 
-`convert-debian-iso.sh` converts an existing Debian installer ISO into a
-*picture hybrid* disc for DiscImageStudio: the installer payload is written
-into a UDF filesystem dispersed into the picture (invisible in the mid-tone
-and flat areas), with an ISO9660 + Joliet-long bridge carrying the El Torito
-boot catalog and the boot-critical files.
+`convert-debian-iso.sh` converts a Debian installer ISO into a picture hybrid
+disc with the shared [`convert-live-iso.sh`](../convert-live-iso.sh) (see
+[the examples README](../README.md) for the two modes, what the converter
+does, its prerequisites and options). Neither mode modifies isolinux or GRUB,
+so UEFI Secure Boot keeps working.
 
 ## Preview
 
@@ -14,59 +14,37 @@ boot catalog and the boot-critical files.
 |----------------|------------------|-----------------|
 | ![Original Cover](cover.png) | ![Simulated Preview](assets/simmulate.png) | ![Area Allocation](assets/map.png)  (Cyan: Free Space; Magenta: Data) |
 
-## Prerequisites
-
-- `disc-image-studio` (this repo; `go build -o disc-image-studio ./cmd/disc-image-studio`)
-- one of `xorriso` or `bsdtar` (to unpack the installer ISO; 7z is unsuitable —
-  its UDF parser rejects symlinks)
-- `ar` + `tar` (+ `xz`/`zstd`/`gzip` decompressors for the packages' payloads;
-  `dpkg-deb` is used instead when available)
-- `cpio` (GNU or BusyBox), `bash`, `sed`, `find`
-- optional: `qemu-system-x86_64` to boot-test the result
-
 ## Usage
 
 ```sh
-./convert-debian-iso.sh -i cover.png -s preview.png \
-    debian-13.x-installer-amd64.iso debian-picture.iso
+./convert-debian-iso.sh -s preview.png debian-13.x-amd64-netinst.iso debian-picture.iso
+./convert-debian-iso.sh --udf-full debian-13.x-amd64-netinst.iso debian-picture.iso
 ```
 
-```
-Options:
-  -i, --image PATH         cover image (default: cover.png next to the script)
-  -l, --volume-label LABEL volume label (default: the input ISO's own)
-  -t, --total-sectors N    disc sector count (default: 2295104, a 4.7 GB DVD)
-      --inner-radius-mm N  inner drawing radius (default: 24)
-      --outer-radius-mm N  outer drawing radius (default: 58)
-      --pitch-linear X     measured linear pitch coefficient (spiral model)
-      --pitch-quadratic X  measured quadratic pitch coefficient
-      --pitch-cubic X      measured cubic pitch coefficient
-  -s, --simulate PATH      also render a simulated read-back preview PNG
-  -- ...                   extra args for solve and simulate
-                           (e.g. -- --channel-bit-nm 133.3)
-```
+## Notes
 
-## What it does
+- **Boot chain.** BIOS: isolinux (`isolinux/isolinux.bin` with its Boot
+  Information Table) loads the kernel and initrd from `install.amd/`. UEFI:
+  GRUB from the ESP `boot/grub/efi.img` (a file of the tree) finds the disc
+  by `/.disk/id/<uuid>` and reads `boot/` and `install.amd/`. All of these
+  are on the bridge, so neither boot loader needs UDF.
+- **Bridge mode (default).** debian-installer's `cdrom-detect` mounts the
+  disc as iso9660, where the archive (`pool/`, `dists/`) is missing.
+  [`prepare-udf.sh`](prepare-udf.sh) appends an overlay to
+  `install.amd/initrd.gz` and `install.amd/gtk/initrd.gz` — the
+  `udf-modules` udeb and a startup hook switching `cdrom-detect` to udf —
+  and updates their `md5sum.txt` lines.
+- **`--udf-full`.** Nothing is modified: `cdrom-detect` mounts the disc as
+  iso9660 and reads the whole archive from the full Rock Ridge tree
+  (symlinks such as `dists/stable -> trixie` included). Boot the disc
+  directly.
+- An earlier version of this example also patched GRUB (`udf.mod` and
+  `insmod udf`), which the signed GRUB refuses under Secure Boot. Putting all
+  of `boot/` on the bridge makes that unnecessary.
+- `cover.png` is a generated placeholder — drop your own cover over it.
 
-1. Unpacks the installer ISO (xorriso, else bsdtar).
-2. Extracts `udf.mod` from the `grub-efi-amd64-bin` package into
-   `boot/grub/x86_64-efi/` (GRUB needs it to read UDF).
-3. Extracts the `udf-modules` udeb into a temporary initrd overlay, moving
-   `/lib` into `/usr/lib` (usrmerge layout of the d-i initrd).
-4. Adds the d-i startup hook `usr/lib/debian-installer-startup.d/S40udf`
-   (makes `cdrom-detect` mount UDF instead of iso9660).
-5. Packs the overlay (`cpio -H newc`, uid:gid 0:0, gzipped).
-6. Appends it to `install.amd/gtk/initrd.gz` and `install.amd/initrd.gz`
-   (concatenated-member gzip, the standard d-i overlay mechanism).
-7. Inserts `insmod udf` into `EFI/debian/grub.cfg` before the real
-   `grub.cfg` is sourced.
-8. Generates the picture disc: `--filesystem udf-bridge` with the EFI boot
-   image (`boot/grub/efi.img`) and the x86 legacy BIOS one
-   (`isolinux/isolinux.bin`, BootInfoTable patched in), exposing the
-   boot-critical paths on the ISO9660 side.
-9. Optionally renders the simulated read-back preview.
-
-`cover.png` here is a generated placeholder — drop your own cover over it.
-
-Note: the `.disk` marker directory keeps its exact name on the disc (the
-Joliet-long tree does not normalize `.disk` to `disk`).
+Verified with `debian-13.7.0-amd64-netinst.iso` in QEMU, both modes: BIOS,
+UEFI and UEFI Secure Boot reach debian-installer, which mounts `/cdrom` (as
+udf in bridge mode, iso9660 with `--udf-full`) and passes
+`md5sum -c md5sum.txt`. On a cover fragmenting 357 files (up to 97
+sections), the `--udf-full` disc still passed all 933 files.

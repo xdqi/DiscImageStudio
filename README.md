@@ -27,9 +27,9 @@ providing the same 12 commands with byte-identical output files:
   `--filesystem udf-full` the ISO9660 side lists the whole tree too
   (fragmented files as multi-extent records), so ISO9660-only software such as
   the Debian installer reads the disc unmodified (boot such discs directly).
-  See [Dispersed hybrid discs (DVD)](#dispersed-hybrid-discs-dvd). For a complete
-  worked example — turning a Debian installer ISO into a bootable picture
-  disc — see [`examples/debian`](examples/debian).
+  See [Dispersed hybrid discs (DVD)](#dispersed-hybrid-discs-dvd). To turn a
+  bootable Linux ISO into a picture disc, see [`examples`](examples): one
+  shared converter with wrappers for Debian, Arch Linux, Fedora and Ubuntu.
 
 ## Dispersed hybrid discs (DVD)
 
